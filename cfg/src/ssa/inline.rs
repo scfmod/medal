@@ -2,7 +2,7 @@ use crate::function::Function;
 use ast::{LocalRw, Reduce, SideEffects, Traverse};
 use indexmap::IndexMap;
 use itertools::{Either, Itertools};
-use petgraph::visit::EdgeRef;
+use petgraph::visit::{depth_first_search, DfsEvent, EdgeRef};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 struct TraverseSelf<'a, T: Traverse>(&'a mut T);
@@ -322,6 +322,39 @@ impl<'a> Inliner<'a> {
             // we cant inline anything with side effects or anything that depends on other params
             // because block params are executed in parallel.
             for edge in self.function.edges(node).map(|e| e.id()).collect_vec() {
+                // Don't inline into phi arguments for blocks that start a for loop
+                // (contain NumForNext or GenericForNext). Doing so would break the
+                // link between the phi parameter and the loop counter variable.
+                //
+                // Also don't inline into blocks that are loop headers (have back edges).
+                // This prevents inlining loop counter values into while loop conditions.
+                let (source, target) = self.function.graph().edge_endpoints(edge).unwrap();
+                let target_block = self.function.block(target).unwrap();
+                let is_for_loop_header = target_block.last().is_some_and(|s| {
+                    matches!(
+                        s,
+                        ast::Statement::NumForNext(_) | ast::Statement::GenericForNext(_)
+                    )
+                });
+                if is_for_loop_header {
+                    continue;
+                }
+
+                // Check if target is a loop header (has an incoming back edge)
+                // A back edge is when a predecessor of the target is dominated by the target
+                // For simplicity, check if any predecessor comes after target in DFS order
+                // (indicating a back edge)
+                let is_loop_header = self.function.predecessor_blocks(target).any(|pred| {
+                    // If the edge goes back to target and source dominates a predecessor,
+                    // this might be a loop. Be conservative - don't inline if there's any
+                    // incoming edge from a node other than the current source.
+                    pred != source && self.function.graph().find_edge(pred, target).is_some()
+                });
+                if is_loop_header {
+                    // Don't inline into loop header phi arguments
+                    continue;
+                }
+
                 // TODO: rename values_read to locals_read
                 let mut arg_to_values_read = self
                     .function
@@ -470,11 +503,75 @@ pub fn inline(
     local_to_group: &FxHashMap<ast::RcLocal, usize>,
     upvalue_to_group: &IndexMap<ast::RcLocal, ast::RcLocal>,
 ) {
+    // Find loop headers (blocks with incoming back edges)
+    let mut loop_headers = FxHashSet::default();
+    if let Some(entry) = *function.entry() {
+        depth_first_search(function.graph(), Some(entry), |event| {
+            if let DfsEvent::BackEdge(_, header) = event {
+                loop_headers.insert(header);
+            }
+        });
+    }
+
+    // Collect phi parameters at loop headers - these should not be inlined
+    // because they are loop variables (counters, etc.) that need to retain
+    // their variable reference in the loop condition.
+    let mut loop_phi_locals = FxHashSet::default();
+    for &header in &loop_headers {
+        // Get all incoming edges to the header
+        for (_, edge) in function.edges_to_block(header) {
+            // The phi arguments on these edges are the loop phi parameters
+            for (param, _) in &edge.arguments {
+                loop_phi_locals.insert(param.clone());
+            }
+        }
+    }
+
+    // Collect all locals involved in for loop constructs - these should not be inlined
+    // to preserve the link between NumForInit/NumForNext and the loop body.
+    let mut for_loop_locals = FxHashSet::default();
+    for node in function.graph().node_indices() {
+        if let Some(block) = function.block(node) {
+            for stat in &block.0 {
+                match stat {
+                    ast::Statement::NumForInit(nfi) => {
+                        for_loop_locals.extend(nfi.values_read().into_iter().cloned());
+                        for_loop_locals.extend(nfi.values_written().into_iter().cloned());
+                    }
+                    ast::Statement::NumForNext(nfn) => {
+                        for_loop_locals.extend(nfn.values_read().into_iter().cloned());
+                        for_loop_locals.extend(nfn.values_written().into_iter().cloned());
+                    }
+                    ast::Statement::GenericForInit(gfi) => {
+                        for_loop_locals.extend(gfi.values_read().into_iter().cloned());
+                        for_loop_locals.extend(gfi.values_written().into_iter().cloned());
+                    }
+                    ast::Statement::GenericForNext(gfn) => {
+                        for_loop_locals.extend(gfn.values_read().into_iter().cloned());
+                        for_loop_locals.extend(gfn.values_written().into_iter().cloned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let mut local_usages = FxHashMap::default();
     for node in function.graph().node_indices() {
         for read in function.values_read(node) {
             *local_usages.entry(read.clone()).or_insert(0usize) += 1;
         }
+    }
+
+    // Mark for loop locals as having high usage count to prevent inlining
+    for local in &for_loop_locals {
+        local_usages.insert(local.clone(), usize::MAX);
+    }
+
+    // Mark loop phi parameters as having high usage count to prevent inlining
+    // This ensures loop counters in while loops keep their variable references
+    for local in &loop_phi_locals {
+        local_usages.insert(local.clone(), usize::MAX);
     }
 
     let mut changed = true;
