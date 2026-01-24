@@ -280,6 +280,10 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     fn format_closure_parameters(&mut self, closure: &Closure) -> fmt::Result {
+        self.format_closure_parameters_skip(closure, 0)
+    }
+
+    fn format_closure_parameters_skip(&mut self, closure: &Closure, skip: usize) -> fmt::Result {
         let function = closure.function.lock();
         write!(
             self.output,
@@ -288,11 +292,12 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 function
                     .parameters
                     .iter()
+                    .skip(skip)
                     .map(|x| x.to_string())
                     .chain(std::iter::once("...".into()))
                     .join(", ")
             } else {
-                function.parameters.iter().join(", ")
+                function.parameters.iter().skip(skip).join(", ")
             }
         )
     }
@@ -348,6 +353,41 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     fn format_named_function(&mut self, name: &LValue, closure: &Closure) -> fmt::Result {
+        // Check if first parameter is named "self" and name is a table index
+        // If so, convert to method notation: function Table:method() instead of function Table.method(self)
+        let first_param_is_self = {
+            let function = closure.function.lock();
+            function
+                .parameters
+                .first()
+                .and_then(|p| p.name())
+                .map(|n| n == "self")
+                .unwrap_or(false)
+        };
+
+        if first_param_is_self {
+            if let LValue::Index(index) = name {
+                // Format the base (e.g., "MyClass" or "MyClass.SubClass")
+                write!(self.output, "function ")?;
+                self.format_rvalue(&index.left)?;
+                // Use : instead of . for the method name
+                if let box RValue::Literal(Literal::String(method_name)) = &index.right {
+                    write!(self.output, ":{}", std::str::from_utf8(method_name).unwrap_or("?"))?;
+                } else {
+                    // Fallback for non-string keys (shouldn't happen for valid method names)
+                    write!(self.output, ":")?;
+                    self.format_rvalue(&index.right)?;
+                }
+                write!(self.output, "(")?;
+                // Skip the "self" parameter
+                self.format_closure_parameters_skip(closure, 1)?;
+                write!(self.output, ")")?;
+                self.format_closure_body(closure)?;
+                return write!(self.output, "end");
+            }
+        }
+
+        // Default: format as regular named function
         write!(self.output, "function {}(", name)?;
         self.format_closure_parameters(closure)?;
         write!(self.output, ")")?;
