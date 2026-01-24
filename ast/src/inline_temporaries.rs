@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{Block, LValue, LocalRw, RValue, RcLocal, Statement, Traverse};
+use crate::{Block, LValue, LocalRw, RValue, RcLocal, Select, Statement, Traverse};
 
 /// Maximum recursion depth to prevent stack overflow
 const MAX_DEPTH: usize = 100;
@@ -15,6 +15,13 @@ const MAX_DEPTH: usize = 100;
 /// For side-effect-free RValues (like field access), inlining can happen
 /// across multiple statements. For calls, inlining only happens into the
 /// immediately following statement to preserve execution order.
+///
+/// Additionally, this pass inlines iterator expressions into generic for-loop
+/// headers. For example:
+///   local v3_, v4_, v5_ = pairs(x)
+///   for k, v in v3_, v4_, v5_ do
+/// Becomes:
+///   for k, v in pairs(x) do
 pub fn inline_temporaries(block: &mut Block) {
     let mut inliner = Inliner::default();
     inliner.inline_block(block, 0, &FxHashSet::default());
@@ -36,10 +43,15 @@ impl Inliner {
             return;
         }
 
-        // First pass: collect all single-use unnamed locals and their definitions
+        // First: inline iterator expressions into generic for-loop headers
+        // This transforms: `local v1, v2, v3 = pairs(x); for k, v in v1, v2, v3 do`
+        // Into: `for k, v in pairs(x) do`
+        self.inline_iterator_into_for_loops(block);
+
+        // Second pass: collect all single-use unnamed locals and their definitions
         let inline_candidates = self.find_inline_candidates(block, protected_locals);
 
-        // Second pass: apply inlines and remove definition statements
+        // Third pass: apply inlines and remove definition statements
         let mut i = 0;
         while i < block.len() {
             // Apply any pending immediate inlines
@@ -77,6 +89,75 @@ impl Inliner {
 
         self.immediate_inlines.clear();
         self.deferred_inlines.clear();
+    }
+
+    /// Inline iterator expressions into generic for-loop headers.
+    ///
+    /// Transforms patterns like:
+    ///   local v1_, v2_, v3_ = pairs(x)
+    ///   for k, v in v1_, v2_, v3_ do
+    /// Into:
+    ///   for k, v in pairs(x) do
+    ///
+    /// This handles both unnamed temporaries and cases where names have leaked
+    /// to the iterator state variables (which is a separate decompilation artifact).
+    fn inline_iterator_into_for_loops(&self, block: &mut Block) {
+        let mut i = 0;
+        while i + 1 < block.len() {
+            // Check if statement i is an assignment and i+1 is a GenericFor
+            let can_inline = if let (
+                Statement::Assign(assign),
+                Statement::GenericFor(generic_for),
+            ) = (&block[i], &block[i + 1])
+            {
+                // The assignment must have a call as its RHS (like pairs() or ipairs())
+                // and the for-loop must use exactly the assigned locals
+                // Note: calls that return multiple values are wrapped in Select::Call
+                let is_iterator_call = assign.right.len() == 1
+                    && matches!(&assign.right[0], RValue::Call(_) | RValue::Select(Select::Call(_)));
+
+                if is_iterator_call && assign.left.len() >= 1 && generic_for.right.len() == assign.left.len() {
+                    // Check that all for-loop iterators are locals matching the assignment
+                    let mut matches = true;
+                    for (j, rv) in generic_for.right.iter().enumerate() {
+                        if let RValue::Local(for_local) = rv {
+                            if let LValue::Local(assign_local) = &assign.left[j] {
+                                if for_local != assign_local {
+                                    matches = false;
+                                    break;
+                                }
+                            } else {
+                                matches = false;
+                                break;
+                            }
+                        } else {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    matches
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if can_inline {
+                // Extract the RHS from the assignment
+                let Statement::Assign(assign) = block.0.remove(i) else {
+                    unreachable!()
+                };
+
+                // Update the GenericFor to use the assignment's RHS directly
+                if let Statement::GenericFor(generic_for) = &mut block[i] {
+                    generic_for.right = assign.right;
+                }
+                // Don't increment i since we removed a statement
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Find all locals that are assigned once and used exactly once
