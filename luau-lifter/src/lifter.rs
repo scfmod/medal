@@ -153,12 +153,19 @@ impl<'a> Lifter<'a> {
         // Pre-populate register map with debug names for all registers that have them.
         // This is necessary because CFG lifting doesn't process blocks in PC order,
         // so a register might first be accessed at a PC outside its debug scope.
+        //
+        // We iterate through all debug entries and for each register, prefer the entry
+        // with a valid (non-compiler-generated) name. This handles cases where a register
+        // has multiple entries (e.g., one without a name and one with).
         let bytecode_func = &self.function_list[self.function.id];
+
         for info in &bytecode_func.local_debug_info {
             let index = info.register as usize;
-            // Skip if already in map (e.g., parameters)
-            if self.register_map.contains_key(&(index, 0)) {
-                continue;
+            // Skip if already in map (e.g., parameters) - but only if it has a valid name
+            if let Some(existing) = self.register_map.get(&(index, 0)) {
+                if existing.name().is_some() {
+                    continue;
+                }
             }
             if info.name_index > 0 {
                 if let Some(name_bytes) = self.string_table.get(info.name_index - 1) {
@@ -1378,6 +1385,7 @@ impl<'a> Lifter<'a> {
         // Try to get the debug name for this register at the current PC
         let bytecode_func = &self.function_list[self.function.id];
         let pc = self.current_pc;
+
 
         self.register_map
             .entry((index, 0))  // Use simple key - scope tracking breaks CFG lifting

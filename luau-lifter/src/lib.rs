@@ -28,7 +28,7 @@ use petgraph::algo::dominators::simple_fast;
 use rayon::prelude::*;
 
 use anyhow::anyhow;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 use walkdir::WalkDir;
 
@@ -207,6 +207,34 @@ fn decompile_function(
         }
         ssa::construct::apply_local_map(&mut function, local_map);
     }
+    // Build set of locals to ignore for declaration: upvalues_in, params, and all their SSA versions
+    // This ensures that when a parameter is reassigned (creating a new SSA version), we don't
+    // declare it as a new local - instead it should be assigned to the parameter directly.
+    // We need to collect this BEFORE SSA destruction since upvalue_to_group is consumed.
+    let mut locals_to_ignore: FxHashSet<ast::RcLocal> = upvalues_in.iter().cloned().collect();
+    locals_to_ignore.extend(function.parameters.iter().cloned());
+
+    // Add all SSA versions of upvalues (these are tracked in upvalue_to_group)
+    for (ssa_version, _) in &upvalue_to_group {
+        locals_to_ignore.insert(ssa_version.clone());
+    }
+
+    // Also check local_to_group for SSA versions of parameters
+    for (ssa_version, _) in &local_to_group {
+        // Check if this SSA version maps back to a parameter
+        for param in &function.parameters {
+            if ssa_version == param {
+                continue;  // Already in locals_to_ignore
+            }
+            // Check if they're in the same local group (meaning ssa_version is an SSA version of param)
+            if let (Some(&version_group), Some(&param_group)) = (local_to_group.get(ssa_version), local_to_group.get(param)) {
+                if version_group == param_group {
+                    locals_to_ignore.insert(ssa_version.clone());
+                }
+            }
+        }
+    }
+
     // cfg::dot::render_to(&function, &mut std::io::stderr()).unwrap();
     ssa::Destructor::new(
         &mut function,
@@ -223,7 +251,7 @@ fn decompile_function(
     LocalDeclarer::default().declare_locals(
         // TODO: why does block.clone() not work?
         Arc::clone(&block),
-        &upvalues_in.iter().chain(params.iter()).cloned().collect(),
+        &locals_to_ignore,
     );
 
     {
