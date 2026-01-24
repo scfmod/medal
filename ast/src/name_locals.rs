@@ -12,7 +12,8 @@ struct Namer {
 impl Namer {
     fn name_local(&mut self, prefix: &str, local: &RcLocal) {
         let mut lock = local.0 .0.lock();
-        if self.rename || lock.0.is_none() {
+        // Only name if no name exists - preserve debug names from bytecode
+        if lock.0.is_none() {
             // TODO: hacky and slow
             if Arc::count(&local.0 .0) == 1 {
                 lock.0 = Some("_".to_string());
@@ -26,6 +27,9 @@ impl Namer {
                 lock.0 = Some(format!("{}{}_", prefix, self.counter));
                 self.counter += 1;
             }
+        } else if self.rename {
+            // If rename is requested and local has a name but is an upvalue,
+            // we may want to add the _u_ marker. For now, preserve the name.
         }
     }
 
