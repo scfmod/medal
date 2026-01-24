@@ -283,6 +283,10 @@ fn link_upvalues(
                             ast::Upvalue::Copy(l) | ast::Upvalue::Ref(l) => l,
                         }))
                 {
+                    // Propagate debug name from parent local to child upvalue if unnamed
+                    if let Some(name) = old.name() {
+                        new.set_name_if_unnamed(Some(name));
+                    }
                     // println!("{} -> {}", old, new);
                     local_map.insert(old.clone(), new.clone());
                 }

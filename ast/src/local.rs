@@ -71,6 +71,14 @@ impl RcLocal {
     pub fn name(&self) -> Option<String> {
         self.0 .0.lock().0.clone()
     }
+
+    /// Set the name of this local, but only if it doesn't already have one
+    pub fn set_name_if_unnamed(&self, name: Option<String>) {
+        let mut lock = self.0 .0.lock();
+        if lock.0.is_none() {
+            lock.0 = name;
+        }
+    }
 }
 
 impl LocalRw for RcLocal {
