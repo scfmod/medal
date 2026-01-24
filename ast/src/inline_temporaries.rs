@@ -53,6 +53,16 @@ impl Inliner {
         // Into: local v3_ = x ~= nil
         simplify_boolean_ternaries(block);
 
+        // Simplify and-chain patterns like:
+        // local v = expr1; if v then v = expr2 end
+        // Into: local v = expr1 and expr2
+        simplify_and_chains(block);
+
+        // Collapse multi-return patterns like:
+        // local v1, v2 = call(); target1 = v1; target2 = v2
+        // Into: target1, target2 = call()
+        collapse_multi_return_assignments(block);
+
         // Second pass: collect all single-use unnamed locals and their definitions
         let inline_candidates = self.find_inline_candidates(block, protected_locals);
 
@@ -127,8 +137,11 @@ impl Inliner {
                 // The assignment must have a call as its RHS (like pairs() or ipairs())
                 // and the for-loop must use exactly the assigned locals
                 // Note: calls that return multiple values are wrapped in Select::Call
+                // Also include MethodCall for things like xmlFile:iterator()
                 let is_iterator_call = assign.right.len() == 1
-                    && matches!(&assign.right[0], RValue::Call(_) | RValue::Select(Select::Call(_)));
+                    && matches!(&assign.right[0],
+                        RValue::Call(_) | RValue::Select(Select::Call(_)) |
+                        RValue::MethodCall(_) | RValue::Select(Select::MethodCall(_)));
 
                 if is_iterator_call && assign.left.len() >= 1 && generic_for.right.len() == assign.left.len() {
                     // Check that all for-loop iterators are locals matching the assignment
@@ -136,7 +149,10 @@ impl Inliner {
                     for (j, rv) in generic_for.right.iter().enumerate() {
                         if let RValue::Local(for_local) = rv {
                             if let LValue::Local(assign_local) = &assign.left[j] {
-                                if for_local != assign_local {
+                                // Compare by identity OR by name for SSA versions
+                                let same = for_local == assign_local
+                                    || (for_local.name().is_some() && for_local.name() == assign_local.name());
+                                if !same {
                                     matches = false;
                                     break;
                                 }
@@ -773,10 +789,41 @@ fn extract_boolean_ternary(if_stat: &If) -> Option<(RcLocal, RValue)> {
         return None;
     }
 
-    // Check if the values are boolean literals
     let then_value = &then_assign.right[0];
     let else_value = &else_assign.right[0];
 
+    // First try: boolean literals (true/false)
+    if let Some(result) = try_extract_boolean_ternary(if_stat, then_local, then_value, else_value) {
+        return Some(result);
+    }
+
+    // Second try: general ternary with truthy then-value
+    // Pattern: if cond then x = val1 else x = val2 end
+    // Becomes: x = cond and val1 or val2
+    // This is only safe when val1 is guaranteed truthy (non-nil, non-false)
+    if is_guaranteed_truthy(then_value) {
+        let ternary = RValue::Binary(crate::Binary::new(
+            RValue::Binary(crate::Binary::new(
+                if_stat.condition.clone(),
+                then_value.clone(),
+                BinaryOperation::And,
+            )),
+            else_value.clone(),
+            BinaryOperation::Or,
+        ));
+        return Some((then_local.clone(), ternary));
+    }
+
+    None
+}
+
+/// Try to extract the special case of boolean true/false ternary
+fn try_extract_boolean_ternary(
+    if_stat: &If,
+    then_local: &RcLocal,
+    then_value: &RValue,
+    else_value: &RValue,
+) -> Option<(RcLocal, RValue)> {
     let then_bool = match then_value {
         RValue::Literal(Literal::Boolean(b)) => Some(*b),
         _ => None,
@@ -802,6 +849,26 @@ fn extract_boolean_ternary(if_stat: &If) -> Option<(RcLocal, RValue)> {
     };
 
     Some((then_local.clone(), simplified))
+}
+
+/// Check if a value is guaranteed to be truthy (not nil, not false)
+/// This is needed for the `cond and val1 or val2` transformation to be safe
+fn is_guaranteed_truthy(value: &RValue) -> bool {
+    match value {
+        // Numbers are always truthy (including 0)
+        RValue::Literal(Literal::Number(_)) => true,
+        // Non-empty strings are truthy
+        RValue::Literal(Literal::String(_)) => true,
+        // Tables are truthy
+        RValue::Table(_) => true,
+        // Closures are truthy
+        RValue::Closure(_) => true,
+        // true is truthy, false and nil are not
+        RValue::Literal(Literal::Boolean(b)) => *b,
+        RValue::Literal(Literal::Nil) => false,
+        // For other expressions (locals, calls, etc.) we can't be sure
+        _ => false,
+    }
 }
 
 /// Convert a condition to a boolean expression.
@@ -885,4 +952,347 @@ fn negate_condition(condition: &RValue) -> RValue {
 
     // Default: wrap in `not`
     RValue::Unary(Unary::new(condition.clone(), UnaryOperation::Not))
+}
+
+/// Simplify and-chain patterns.
+///
+/// Transforms patterns like:
+///   local v = expr1
+///   if v then
+///       v = expr2
+///   end
+///
+/// Into:
+///   local v = expr1 and expr2
+///
+/// This handles the common Lua idiom for short-circuit evaluation chains.
+/// The pattern can repeat multiple times:
+///   local v = expr1
+///   if v then v = expr2 end
+///   if v then v = expr3 end
+/// Into:
+///   local v = expr1 and expr2 and expr3
+fn simplify_and_chains(block: &mut Block) {
+    let mut i = 0;
+    while i < block.len() {
+        // First, recurse into nested blocks
+        match &mut block[i] {
+            Statement::If(if_stat) => {
+                simplify_and_chains(&mut if_stat.then_block.lock());
+                simplify_and_chains(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                simplify_and_chains(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                simplify_and_chains(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                simplify_and_chains(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                simplify_and_chains(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Check for closures in RValues
+        for rvalue in block[i].rvalues_mut() {
+            simplify_and_chains_in_rvalue(rvalue);
+        }
+
+        // Look for pattern: assign to local, then if-reassign chain
+        // Start by checking if current statement is an assignment to a single local
+        let Some(assign) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        if assign.left.len() != 1 || assign.right.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        let Some(local) = assign.left[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        // Only simplify unnamed temporaries
+        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+        if !is_unnamed {
+            i += 1;
+            continue;
+        }
+
+        let local = local.clone();
+        let is_prefix = assign.prefix;
+
+        // Now look ahead for if-reassign patterns
+        let mut j = i + 1;
+        let mut chain_count = 0;
+
+        while j < block.len() {
+            if is_and_chain_pattern(&block[j], &local) {
+                chain_count += 1;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        if chain_count == 0 {
+            i += 1;
+            continue;
+        }
+
+        // Now fold all the if statements into the assignment
+        // Get the initial RValue
+        let Statement::Assign(assign) = &mut block[i] else {
+            unreachable!()
+        };
+        let mut combined = assign.right[0].clone();
+
+        // Fold each if statement
+        for k in (i + 1)..=(i + chain_count) {
+            let new_value = extract_and_chain_value(&block[k]);
+
+            // Create: combined and new_value
+            combined = RValue::Binary(crate::Binary::new(
+                combined,
+                new_value,
+                BinaryOperation::And,
+            ));
+        }
+
+        // Update the original assignment
+        let Statement::Assign(assign) = &mut block[i] else {
+            unreachable!()
+        };
+        assign.right[0] = combined;
+        assign.prefix = is_prefix;
+
+        // Remove the if statements
+        for _ in 0..chain_count {
+            block.0.remove(i + 1);
+        }
+
+        i += 1;
+    }
+}
+
+fn simplify_and_chains_in_rvalue(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        simplify_and_chains(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        simplify_and_chains_in_rvalue(rv);
+    }
+}
+
+/// Check if statement matches the and-chain pattern: if v then v = expr end
+fn is_and_chain_pattern(statement: &Statement, target_local: &RcLocal) -> bool {
+    let Some(if_stat) = statement.as_if() else {
+        return false;
+    };
+
+    // Check condition is the local itself
+    let Some(cond_local) = if_stat.condition.as_local() else {
+        return false;
+    };
+
+    // Must be same local (by identity or name)
+    let same = cond_local == target_local
+        || (cond_local.name().is_some() && cond_local.name() == target_local.name());
+    if !same {
+        return false;
+    }
+
+    // Must have empty else branch
+    if !if_stat.else_block.lock().is_empty() {
+        return false;
+    }
+
+    // Then branch must have exactly one assignment
+    let then_block = if_stat.then_block.lock();
+    if then_block.len() != 1 {
+        return false;
+    }
+
+    let Some(then_assign) = then_block[0].as_assign() else {
+        return false;
+    };
+
+    // Must assign to single local
+    if then_assign.left.len() != 1 || then_assign.right.len() != 1 {
+        return false;
+    }
+
+    let Some(assign_local) = then_assign.left[0].as_local() else {
+        return false;
+    };
+
+    // Must assign to the same local
+    assign_local == target_local
+        || (assign_local.name().is_some() && assign_local.name() == target_local.name())
+}
+
+/// Extract the new value from an and-chain if statement
+fn extract_and_chain_value(statement: &Statement) -> RValue {
+    let if_stat = statement.as_if().unwrap();
+    let then_block = if_stat.then_block.lock();
+    let then_assign = then_block[0].as_assign().unwrap();
+    then_assign.right[0].clone()
+}
+
+/// Collapse multi-return assignment patterns.
+///
+/// Transforms patterns like:
+///   local v1, v2 = call()
+///   target1 = v1
+///   target2 = v2
+///
+/// Into:
+///   target1, target2 = call()
+///
+/// This handles the common case where multiple return values from a call
+/// are assigned to temporary locals and then immediately assigned to their
+/// final destinations (fields, table indices, etc.)
+fn collapse_multi_return_assignments(block: &mut Block) {
+    let mut i = 0;
+    while i < block.len() {
+        // First, recurse into nested blocks
+        match &mut block[i] {
+            Statement::If(if_stat) => {
+                collapse_multi_return_assignments(&mut if_stat.then_block.lock());
+                collapse_multi_return_assignments(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                collapse_multi_return_assignments(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                collapse_multi_return_assignments(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                collapse_multi_return_assignments(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                collapse_multi_return_assignments(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Check for closures in RValues
+        for rvalue in block[i].rvalues_mut() {
+            collapse_multi_return_in_rvalue(rvalue);
+        }
+
+        // Look for pattern: local v1, v2, ... = call()
+        let Some(assign) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Must have multiple locals on the left and a single call on the right
+        if assign.left.len() < 2 || assign.right.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        // All left-hand sides must be unnamed local temporaries
+        let locals: Vec<_> = assign.left.iter()
+            .filter_map(|lv| lv.as_local())
+            .filter(|l| l.name().map_or(true, |n| is_unnamed_temporary(&n)))
+            .cloned()
+            .collect();
+
+        if locals.len() != assign.left.len() {
+            i += 1;
+            continue;
+        }
+
+        // Right side must be a call (or method call), possibly wrapped in Select for multi-return
+        let is_call = matches!(&assign.right[0],
+            RValue::Call(_) |
+            RValue::MethodCall(_) |
+            RValue::Select(Select::Call(_)) |
+            RValue::Select(Select::MethodCall(_))
+        );
+        if !is_call {
+            i += 1;
+            continue;
+        }
+
+        // Now look ahead for consecutive single assignments that use each local exactly once
+        // in order: target1 = v1, target2 = v2, ...
+        let num_locals = locals.len();
+        let mut targets: Vec<LValue> = Vec::with_capacity(num_locals);
+        let mut matched_count = 0;
+
+        for (idx, local) in locals.iter().enumerate() {
+            let next_idx = i + 1 + idx;
+            if next_idx >= block.len() {
+                break;
+            }
+
+            let Some(next_assign) = block[next_idx].as_assign() else {
+                break;
+            };
+
+            // Must be single assignment: target = local
+            if next_assign.left.len() != 1 || next_assign.right.len() != 1 {
+                break;
+            }
+
+            // Right side must be this local
+            let Some(rhs_local) = next_assign.right[0].as_local() else {
+                break;
+            };
+
+            let same = rhs_local == local
+                || (rhs_local.name().is_some() && rhs_local.name() == local.name());
+            if !same {
+                break;
+            }
+
+            targets.push(next_assign.left[0].clone());
+            matched_count += 1;
+        }
+
+        // Only collapse if we matched ALL the locals
+        if matched_count != num_locals {
+            i += 1;
+            continue;
+        }
+
+        // Extract the call RValue
+        let Statement::Assign(assign) = &mut block[i] else {
+            unreachable!()
+        };
+        let call_rvalue = assign.right[0].clone();
+
+        // Create the collapsed assignment: target1, target2, ... = call()
+        let collapsed = Assign::new(targets, vec![call_rvalue]);
+
+        // Replace the original multi-local assignment with the collapsed one
+        block.0[i] = collapsed.into();
+
+        // Remove the individual assignments
+        for _ in 0..matched_count {
+            block.0.remove(i + 1);
+        }
+
+        i += 1;
+    }
+}
+
+fn collapse_multi_return_in_rvalue(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        collapse_multi_return_assignments(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        collapse_multi_return_in_rvalue(rv);
+    }
 }
