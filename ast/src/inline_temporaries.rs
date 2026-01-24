@@ -48,6 +48,11 @@ impl Inliner {
         // Into: `for k, v in pairs(x) do`
         self.inline_iterator_into_for_loops(block);
 
+        // Simplify boolean ternary patterns like:
+        // local v3_; if x == nil then v3_ = false else v3_ = true end
+        // Into: local v3_ = x ~= nil
+        simplify_boolean_ternaries(block);
+
         // Second pass: collect all single-use unnamed locals and their definitions
         let inline_candidates = self.find_inline_candidates(block, protected_locals);
 
@@ -91,17 +96,26 @@ impl Inliner {
         self.deferred_inlines.clear();
     }
 
-    /// Inline iterator expressions into generic for-loop headers.
+    /// Inline expressions into for-loop headers.
     ///
-    /// Transforms patterns like:
+    /// For generic for loops, transforms patterns like:
     ///   local v1_, v2_, v3_ = pairs(x)
     ///   for k, v in v1_, v2_, v3_ do
     /// Into:
     ///   for k, v in pairs(x) do
     ///
+    /// For numeric for loops, transforms patterns like:
+    ///   local v2_ = select("#", ...)
+    ///   for i = 1, v2_ do
+    /// Into:
+    ///   for i = 1, select("#", ...) do
+    ///
     /// This handles both unnamed temporaries and cases where names have leaked
     /// to the iterator state variables (which is a separate decompilation artifact).
     fn inline_iterator_into_for_loops(&self, block: &mut Block) {
+        // First handle numeric for loops
+        self.inline_into_numeric_for_loops(block);
+        // Then handle generic for loops (existing logic below)
         let mut i = 0;
         while i + 1 < block.len() {
             // Check if statement i is an assignment and i+1 is a GenericFor
@@ -157,6 +171,116 @@ impl Inliner {
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// Inline expressions into numeric for-loop headers (initial, limit, step).
+    ///
+    /// Transforms patterns like:
+    ///   local v2_ = select("#", ...)
+    ///   for i = 1, v2_ do
+    /// Into:
+    ///   for i = 1, select("#", ...) do
+    ///
+    /// Also handles the special case where the loop counter is initialized separately:
+    ///   local i = 1
+    ///   for i = i, limit do
+    /// Into:
+    ///   for i = 1, limit do
+    ///
+    /// This searches backwards from the for-loop to find assignments to locals
+    /// used in the for-loop header.
+    fn inline_into_numeric_for_loops(&self, block: &mut Block) {
+        let mut for_idx = 0;
+        while for_idx < block.len() {
+            let Statement::NumericFor(numeric_for) = &block[for_idx] else {
+                for_idx += 1;
+                continue;
+            };
+
+            // Collect locals used in the for-loop header
+            let initial_local = if let RValue::Local(l) = &numeric_for.initial { Some(l.clone()) } else { None };
+            let limit_local = if let RValue::Local(l) = &numeric_for.limit { Some(l.clone()) } else { None };
+            let step_local = if let RValue::Local(l) = &numeric_for.step { Some(l.clone()) } else { None };
+
+            // Search backwards for assignments that can be inlined
+            let mut assign_idx = for_idx;
+            while assign_idx > 0 {
+                assign_idx -= 1;
+
+                let Statement::Assign(assign) = &block[assign_idx] else {
+                    continue;
+                };
+
+                if assign.left.len() != 1 || assign.right.len() != 1 {
+                    continue;
+                }
+
+                let LValue::Local(assign_local) = &assign.left[0] else {
+                    continue;
+                };
+
+                // Check if this assignment is to a local used in the for-loop header
+                let same_local_or_name = |l: &RcLocal| {
+                    l == assign_local ||
+                    (assign_local.name().is_some() && l.name() == assign_local.name())
+                };
+
+                let matches_initial = initial_local.as_ref().map_or(false, |l| same_local_or_name(l));
+                let matches_limit = limit_local.as_ref().map_or(false, |l| same_local_or_name(l));
+                let matches_step = step_local.as_ref().map_or(false, |l| same_local_or_name(l));
+
+                // Count how many places this local is used in the for header
+                let use_count = [matches_initial, matches_limit, matches_step]
+                    .iter()
+                    .filter(|&&b| b)
+                    .count();
+
+                if use_count != 1 {
+                    continue;
+                }
+
+                // For unnamed temporaries, always inline
+                // For named locals, only inline if used in initial position
+                let is_unnamed = assign_local.name()
+                    .map_or(true, |n| is_unnamed_temporary(&n));
+
+                let should_inline = if is_unnamed {
+                    true
+                } else {
+                    // Named local: only inline into initial position
+                    matches_initial
+                };
+
+                if !should_inline {
+                    continue;
+                }
+
+                // Extract the assignment
+                let Statement::Assign(assign) = block.0.remove(assign_idx) else {
+                    unreachable!()
+                };
+                let rvalue = assign.right.into_iter().next().unwrap();
+
+                // Update for_idx since we removed a statement before it
+                for_idx -= 1;
+
+                // Update the NumericFor to use the assignment's RHS directly
+                if let Statement::NumericFor(numeric_for) = &mut block[for_idx] {
+                    if matches_initial {
+                        numeric_for.initial = rvalue;
+                    } else if matches_limit {
+                        numeric_for.limit = rvalue;
+                    } else if matches_step {
+                        numeric_for.step = rvalue;
+                    }
+                }
+
+                // Continue searching for more assignments (may need to inline multiple)
+                // Note: assign_idx is already decremented by the loop
+            }
+
+            for_idx += 1;
         }
     }
 
@@ -513,4 +637,252 @@ fn has_side_effects(rvalue: &RValue) -> bool {
         RValue::Index(index) => has_side_effects(&index.left) || has_side_effects(&index.right),
         _ => false,
     }
+}
+
+use crate::{Assign, BinaryOperation, If, Literal, Unary, UnaryOperation};
+
+/// Simplify boolean ternary patterns.
+///
+/// Transforms patterns like:
+///   local v3_
+///   if condition then
+///       v3_ = false
+///   else
+///       v3_ = true
+///   end
+///
+/// Into:
+///   local v3_ = not condition
+///
+/// Also handles the inverted case:
+///   if condition then v3_ = true else v3_ = false end
+/// Into:
+///   local v3_ = condition  (or v3_ = condition ~= nil for nil checks)
+fn simplify_boolean_ternaries(block: &mut Block) {
+    let mut i = 0;
+    while i < block.len() {
+        // First, recurse into nested blocks
+        match &mut block[i] {
+            Statement::If(if_stat) => {
+                simplify_boolean_ternaries(&mut if_stat.then_block.lock());
+                simplify_boolean_ternaries(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                simplify_boolean_ternaries(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                simplify_boolean_ternaries(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                simplify_boolean_ternaries(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                simplify_boolean_ternaries(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Check for closures in RValues
+        for rvalue in block[i].rvalues_mut() {
+            simplify_ternaries_in_rvalue(rvalue);
+        }
+
+        // Now check for the ternary pattern: if cond then x = true/false else x = false/true end
+        if let Statement::If(if_stat) = &block[i] {
+            if let Some((local, value)) = extract_boolean_ternary(if_stat) {
+                // Check if there's a preceding declaration for this local that we can merge
+                let has_preceding_decl = i > 0 && is_empty_declaration_for(&block[i - 1], &local);
+
+                // Replace the if statement with an assignment
+                let mut assign = Assign::new(vec![LValue::Local(local)], vec![value]);
+
+                if has_preceding_decl {
+                    // Remove the preceding declaration and make this a prefix assignment
+                    block.0.remove(i - 1);
+                    i -= 1;
+                    assign.prefix = true;
+                }
+
+                block.0[i] = assign.into();
+            }
+        }
+
+        i += 1;
+    }
+}
+
+/// Check if a statement is an empty declaration (prefix assignment with no RHS) for a specific local
+fn is_empty_declaration_for(statement: &Statement, target_local: &RcLocal) -> bool {
+    if let Statement::Assign(assign) = statement {
+        if assign.prefix && assign.right.is_empty() && assign.left.len() == 1 {
+            if let Some(local) = assign.left[0].as_local() {
+                // Compare by identity or by name for SSA versions
+                return local == target_local ||
+                    (local.name().is_some() && local.name() == target_local.name());
+            }
+        }
+    }
+    false
+}
+
+fn simplify_ternaries_in_rvalue(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        simplify_boolean_ternaries(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        simplify_ternaries_in_rvalue(rv);
+    }
+}
+
+/// Extract the boolean ternary pattern from an if statement.
+///
+/// Returns Some((local, simplified_value)) if the pattern matches:
+///   if condition then local = true/false else local = false/true end
+///
+/// The simplified_value will be either the condition itself (possibly with `not`)
+/// or for nil checks like `x == nil`, it will be `x ~= nil` or `x == nil`.
+fn extract_boolean_ternary(if_stat: &If) -> Option<(RcLocal, RValue)> {
+    let then_block = if_stat.then_block.lock();
+    let else_block = if_stat.else_block.lock();
+
+    // Both branches must have exactly one statement
+    if then_block.len() != 1 || else_block.len() != 1 {
+        return None;
+    }
+
+    // Both statements must be assignments
+    let then_assign = then_block[0].as_assign()?;
+    let else_assign = else_block[0].as_assign()?;
+
+    // Both must assign to a single local
+    if then_assign.left.len() != 1 || else_assign.left.len() != 1 {
+        return None;
+    }
+    if then_assign.right.len() != 1 || else_assign.right.len() != 1 {
+        return None;
+    }
+
+    let then_local = then_assign.left[0].as_local()?;
+    let else_local = else_assign.left[0].as_local()?;
+
+    // Must be assigning to the same local (compare by identity or by name for SSA versions)
+    let same_local = then_local == else_local ||
+        (then_local.name().is_some() && then_local.name() == else_local.name());
+    if !same_local {
+        return None;
+    }
+
+    // Check if the values are boolean literals
+    let then_value = &then_assign.right[0];
+    let else_value = &else_assign.right[0];
+
+    let then_bool = match then_value {
+        RValue::Literal(Literal::Boolean(b)) => Some(*b),
+        _ => None,
+    }?;
+
+    let else_bool = match else_value {
+        RValue::Literal(Literal::Boolean(b)) => Some(*b),
+        _ => None,
+    }?;
+
+    // Must be opposite booleans
+    if then_bool == else_bool {
+        return None;
+    }
+
+    // Now simplify the condition based on which branch is true
+    let simplified = if then_bool {
+        // if cond then x = true else x = false => x = cond (or simplified form)
+        simplify_to_boolean(&if_stat.condition)
+    } else {
+        // if cond then x = false else x = true => x = not cond (or simplified form)
+        negate_condition(&if_stat.condition)
+    };
+
+    Some((then_local.clone(), simplified))
+}
+
+/// Convert a condition to a boolean expression.
+///
+/// For comparisons like `x == nil`, returns `x ~= nil` (which is a boolean).
+/// For other expressions, returns the expression as-is (truthy/falsy behavior).
+fn simplify_to_boolean(condition: &RValue) -> RValue {
+    // For `x == nil`, we can use `x ~= nil` which is already boolean
+    if let RValue::Binary(binary) = condition {
+        if binary.operation == BinaryOperation::Equal {
+            if matches!(&*binary.right, RValue::Literal(Literal::Nil)) {
+                // x == nil => x ~= nil (inverted)
+                return RValue::Binary(crate::Binary::new(
+                    (*binary.left).clone(),
+                    (*binary.right).clone(),
+                    BinaryOperation::NotEqual,
+                ));
+            }
+            if matches!(&*binary.left, RValue::Literal(Literal::Nil)) {
+                // nil == x => x ~= nil (inverted)
+                return RValue::Binary(crate::Binary::new(
+                    (*binary.right).clone(),
+                    (*binary.left).clone(),
+                    BinaryOperation::NotEqual,
+                ));
+            }
+        }
+        if binary.operation == BinaryOperation::NotEqual {
+            if matches!(&*binary.right, RValue::Literal(Literal::Nil)) {
+                // x ~= nil => already boolean, just return as-is
+                return condition.clone();
+            }
+            if matches!(&*binary.left, RValue::Literal(Literal::Nil)) {
+                // nil ~= x => x ~= nil
+                return RValue::Binary(crate::Binary::new(
+                    (*binary.right).clone(),
+                    (*binary.left).clone(),
+                    BinaryOperation::NotEqual,
+                ));
+            }
+        }
+    }
+
+    // For other conditions, return as-is
+    condition.clone()
+}
+
+/// Negate a condition, simplifying where possible.
+///
+/// For `x == nil`, returns `x ~= nil`.
+/// For `x ~= nil`, returns `x == nil`.
+/// For other expressions, returns `not condition`.
+fn negate_condition(condition: &RValue) -> RValue {
+    // For comparisons, we can flip the operator
+    if let RValue::Binary(binary) = condition {
+        let flipped_op = match binary.operation {
+            BinaryOperation::Equal => Some(BinaryOperation::NotEqual),
+            BinaryOperation::NotEqual => Some(BinaryOperation::Equal),
+            BinaryOperation::LessThan => Some(BinaryOperation::GreaterThanOrEqual),
+            BinaryOperation::LessThanOrEqual => Some(BinaryOperation::GreaterThan),
+            BinaryOperation::GreaterThan => Some(BinaryOperation::LessThanOrEqual),
+            BinaryOperation::GreaterThanOrEqual => Some(BinaryOperation::LessThan),
+            _ => None,
+        };
+
+        if let Some(op) = flipped_op {
+            return RValue::Binary(crate::Binary::new(
+                (*binary.left).clone(),
+                (*binary.right).clone(),
+                op,
+            ));
+        }
+    }
+
+    // For `not x`, return `x`
+    if let RValue::Unary(unary) = condition {
+        if unary.operation == UnaryOperation::Not {
+            return (*unary.value).clone();
+        }
+    }
+
+    // Default: wrap in `not`
+    RValue::Unary(Unary::new(condition.clone(), UnaryOperation::Not))
 }
