@@ -27,6 +27,114 @@ impl GraphStructurer {
             .unwrap_or(false)
     }
 
+    /// Converts an unstructurable for loop to a while loop by:
+    /// 1. Converting NumForInit to variable assignments
+    /// 2. Converting NumForNext to a condition check
+    /// This ensures that the loop variables are properly defined.
+    fn convert_for_to_while(&mut self, header: NodeIndex) {
+        // Find the init block and convert NumForInit to assignments
+        if let Ok((init_block, init_index)) = self
+            .function
+            .predecessor_blocks(header)
+            .filter(|&p| p != header)
+            .filter_map(|p| {
+                self.function
+                    .block(p)
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, s)| s.as_num_for_init().is_some())
+                    .map(|(i, _)| (p, i))
+            })
+            .exactly_one()
+        {
+            // Convert NumForInit to assignments
+            let init_block_ast = self.function.block_mut(init_block).unwrap();
+            if let Some(nfi) = init_block_ast[init_index].as_num_for_init() {
+                // Create assignments for counter, limit, step
+                // But we need to use the correct variable names
+                let counter_local = nfi.counter.0.as_local().unwrap().clone();
+                let counter_init = nfi.counter.1.clone();
+                let limit_local = nfi.limit.0.as_local().unwrap().clone();
+                let limit_init = nfi.limit.1.clone();
+                let step_local = nfi.step.0.as_local().unwrap().clone();
+                let step_init = nfi.step.1.clone();
+
+                // Replace NumForInit with assignments
+                init_block_ast.0.remove(init_index);
+                init_block_ast.0.insert(
+                    init_index,
+                    ast::Assign::new(
+                        vec![ast::LValue::Local(counter_local)],
+                        vec![counter_init],
+                    )
+                    .into(),
+                );
+                init_block_ast.0.insert(
+                    init_index + 1,
+                    ast::Assign::new(
+                        vec![ast::LValue::Local(limit_local)],
+                        vec![limit_init],
+                    )
+                    .into(),
+                );
+                init_block_ast.0.insert(
+                    init_index + 2,
+                    ast::Assign::new(
+                        vec![ast::LValue::Local(step_local)],
+                        vec![step_init],
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Convert NumForNext in header to If condition
+        let header_block = self.function.block_mut(header).unwrap();
+        if let Some(idx) = header_block
+            .0
+            .iter()
+            .position(|s| s.as_num_for_next().is_some())
+        {
+            if let Some(nfn) = header_block[idx].as_num_for_next() {
+                // Create condition: counter <= limit
+                let counter_local = nfn.counter.0.as_local().unwrap().clone();
+                let counter_rvalue = nfn.counter.1.clone();
+                let limit = nfn.limit.clone();
+                let step = nfn.step.clone();
+
+                // Replace NumForNext with If statement
+                // Also add counter increment at the end
+                let condition = ast::Binary::new(
+                    counter_rvalue.clone(),
+                    limit,
+                    ast::BinaryOperation::LessThanOrEqual,
+                )
+                .into();
+
+                // Create counter increment: counter = counter + step
+                let increment = ast::Assign::new(
+                    vec![ast::LValue::Local(counter_local.clone())],
+                    vec![ast::Binary::new(
+                        counter_rvalue,
+                        step,
+                        ast::BinaryOperation::Add,
+                    )
+                    .into()],
+                );
+
+                header_block.0.remove(idx);
+                header_block.0.insert(
+                    idx,
+                    ast::If::new(condition, ast::Block::default(), ast::Block::default()).into(),
+                );
+                // Add increment after the if
+                header_block.0.push(increment.into());
+            }
+        }
+    }
+
     // TODO: for init should always be at the end of a block?
     fn find_for_init(&mut self, for_loop: NodeIndex) -> (NodeIndex, usize) {
         let predecessors = self
@@ -76,24 +184,31 @@ impl GraphStructurer {
                     .map(|e| e.target());
                 let then_successors = self.function.successor_blocks(then_node).collect_vec();
 
-                if then_successors.len() > 1 {
+                let can_structure_for_loop = then_successors.len() <= 1 && {
+                    let (init_block, init_index) = self.find_for_init(header);
+                    let structure_ok = if then_node != else_node {
+                        self.function.predecessor_blocks(then_node).count() == 1
+                    } else {
+                        true
+                    };
+                    if !structure_ok {
+                        false
+                    } else {
+                        let else_successors = self.function.successor_blocks(else_node).collect_vec();
+                        (!then_successors.is_empty() && then_successors[0] == else_node)
+                            || (else_successors.len() == 1 && then_successors[0] == else_successors[0])
+                            || (then_successors[0] == header && else_node == init_block)
+                    }
+                };
+
+                if !can_structure_for_loop {
+                    // Can't structure as a for loop - convert NumForInit to assignments
+                    // and NumForNext to a while condition so the variables are properly defined
+                    self.convert_for_to_while(header);
                     return false;
                 }
 
                 let (init_block, init_index) = self.find_for_init(header);
-                if then_node != else_node
-                    && self.function.predecessor_blocks(then_node).count() != 1
-                {
-                    return false;
-                }
-
-                let else_successors = self.function.successor_blocks(else_node).collect_vec();
-                if !(!then_successors.is_empty() && then_successors[0] == else_node)
-                    && !(else_successors.len() == 1 && then_successors[0] == else_successors[0])
-                    && !(then_successors[0] == header && else_node == init_block)
-                {
-                    return false;
-                }
 
                 let statement = self.function.block_mut(header).unwrap().pop().unwrap();
                 let statements = std::mem::take(&mut self.function.block_mut(header).unwrap().0);
@@ -420,6 +535,7 @@ impl GraphStructurer {
                 let statement = self.function.block_mut(header).unwrap().pop().unwrap();
                 if let ast::Statement::If(if_stat) = statement {
                     let mut if_condition = if_stat.condition;
+
                     let header_else_target =
                         self.function.conditional_edges(header).unwrap().1.target();
                     let block = self.function.remove_block(body).unwrap();

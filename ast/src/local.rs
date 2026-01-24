@@ -58,6 +58,19 @@ impl RcLocal {
     pub fn new(local: Local) -> Self {
         Self(ByAddress(Arc::new(Mutex::new(local))))
     }
+
+    /// Create a new RcLocal that copies the name from an existing local.
+    /// This is useful for SSA construction where we want to preserve
+    /// debug names through variable renaming.
+    pub fn clone_with_name(other: &RcLocal) -> Self {
+        let name = other.0 .0.lock().0.clone();
+        Self::new(Local::new(name))
+    }
+
+    /// Get the name of this local, if any
+    pub fn name(&self) -> Option<String> {
+        self.0 .0.lock().0.clone()
+    }
 }
 
 impl LocalRw for RcLocal {

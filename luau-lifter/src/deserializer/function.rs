@@ -14,6 +14,15 @@ use super::{
 
 use crate::{instruction::*, op_code::OpCode};
 
+/// Debug info for a local variable in Luau bytecode
+#[derive(Debug, Clone)]
+pub struct LocalDebugInfo {
+    pub name_index: usize,  // Index into string table (1-based, 0 = no name)
+    pub scope_start: usize, // PC where variable scope starts
+    pub scope_end: usize,   // PC where variable scope ends
+    pub register: u8,       // Register number this variable uses
+}
+
 #[derive(Debug)]
 pub struct Function {
     pub max_stack_size: u8,
@@ -29,6 +38,8 @@ pub struct Function {
     pub line_gap_log2: Option<u8>,
     pub line_info_delta: Option<Vec<u8>>,
     pub abs_line_info_delta: Option<Vec<u32>>,
+    pub local_debug_info: Vec<LocalDebugInfo>,
+    pub upvalue_debug_names: Vec<usize>,  // name indices for upvalues (1-based, 0 = no name)
 }
 
 impl Function {
@@ -158,22 +169,32 @@ impl Function {
                 (input, Some(abs_line_info_delta))
             }
         };
-        let input = match le_u8(input)? {
-            (input, 0) => input,
+        let (input, (local_debug_info, upvalue_debug_names)) = match le_u8(input)? {
+            (input, 0) => (input, (Vec::new(), Vec::new())),
             (input, _) => {
-                // panic!("we have debug info");
                 let (mut input, num_locvars) = leb128_usize(input)?;
+                let mut debug_info = Vec::with_capacity(num_locvars);
                 for _ in 0..num_locvars {
-                    (input, _) = leb128_usize(input)?;
-                    (input, _) = leb128_usize(input)?;
-                    (input, _) = leb128_usize(input)?;
-                    (input, _) = le_u8(input)?;
+                    let (new_input, name_index) = leb128_usize(input)?;
+                    let (new_input, scope_start) = leb128_usize(new_input)?;
+                    let (new_input, scope_end) = leb128_usize(new_input)?;
+                    let (new_input, register) = le_u8(new_input)?;
+                    input = new_input;
+                    debug_info.push(LocalDebugInfo {
+                        name_index,
+                        scope_start,
+                        scope_end,
+                        register,
+                    });
                 }
-                let (mut input, num_upvalues) = leb128_usize(input)?;
-                for _ in 0..num_upvalues {
-                    (input, _) = leb128_usize(input)?;
+                let (mut input, num_upvalue_names) = leb128_usize(input)?;
+                let mut upvalue_names = Vec::with_capacity(num_upvalue_names);
+                for _ in 0..num_upvalue_names {
+                    let name_index;
+                    (input, name_index) = leb128_usize(input)?;
+                    upvalue_names.push(name_index);
                 }
-                input
+                (input, (debug_info, upvalue_names))
             }
         };
         Ok((
@@ -191,7 +212,33 @@ impl Function {
                 line_gap_log2,
                 line_info_delta,
                 abs_line_info_delta,
+                local_debug_info,
+                upvalue_debug_names,
             },
         ))
+    }
+
+    /// Get the debug name index for a register at a specific PC, if available.
+    /// Returns the name_index from debug info (1-based into string table).
+    /// The PC is used to find the correct scope when a register is reused
+    /// for different variables in different scopes.
+    pub fn get_debug_name_for_register(&self, register: u8, pc: usize) -> Option<usize> {
+        // Find the debug info entry for this register that contains the current PC in its scope.
+        // If multiple entries match (nested scopes), prefer the one with the narrowest scope
+        // (largest scope_start that still contains pc).
+        //
+        // Note: Luau debug info has scope_start pointing to the instruction AFTER the assignment.
+        // We extend the range by a few instructions to catch the assignment itself.
+        // This handles cases like: reg 3 written at PC 11, scope_start = 14 (for xmlFileContent)
+        const SCOPE_EXTENSION: usize = 5;
+        self.local_debug_info
+            .iter()
+            .filter(|info| {
+                info.register == register
+                    && info.scope_start <= pc + SCOPE_EXTENSION
+                    && pc < info.scope_end
+            })
+            .max_by_key(|info| info.scope_start)
+            .map(|info| info.name_index)
     }
 }

@@ -4,6 +4,7 @@ mod lifter;
 mod op_code;
 
 use ast::{
+    cleanup_for_statements::cleanup_for_statements, inline_temporaries::inline_temporaries,
     local_declarations::LocalDeclarer, name_locals::name_locals, replace_locals::replace_locals,
     Traverse,
 };
@@ -27,7 +28,7 @@ use petgraph::algo::dominators::simple_fast;
 use rayon::prelude::*;
 
 use anyhow::anyhow;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 use walkdir::WalkDir;
 
@@ -137,7 +138,9 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
             upvalues.remove(&main);
             let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
             link_upvalues(&mut body, &mut upvalues);
+            cleanup_for_statements(&mut body);
             name_locals(&mut body, true);
+            inline_temporaries(&mut body);
             body.to_string()
         }
     }
@@ -173,7 +176,13 @@ fn decompile_function(
     // etc.
     // the macro could also maybe generate an optimal ordering?
     let mut changed = true;
+    let mut iteration = 0;
     while changed {
+        iteration += 1;
+        if iteration > 100 {
+            // Safety limit to prevent infinite loops
+            break;
+        }
         changed = false;
 
         let dominators = simple_fast(function.graph(), function.entry().unwrap());
@@ -198,7 +207,35 @@ fn decompile_function(
         }
         ssa::construct::apply_local_map(&mut function, local_map);
     }
-    // cfg::dot::render_to(&function, &mut std::io::stdout()).unwrap();
+    // Build set of locals to ignore for declaration: upvalues_in, params, and all their SSA versions
+    // This ensures that when a parameter is reassigned (creating a new SSA version), we don't
+    // declare it as a new local - instead it should be assigned to the parameter directly.
+    // We need to collect this BEFORE SSA destruction since upvalue_to_group is consumed.
+    let mut locals_to_ignore: FxHashSet<ast::RcLocal> = upvalues_in.iter().cloned().collect();
+    locals_to_ignore.extend(function.parameters.iter().cloned());
+
+    // Add all SSA versions of upvalues (these are tracked in upvalue_to_group)
+    for (ssa_version, _) in &upvalue_to_group {
+        locals_to_ignore.insert(ssa_version.clone());
+    }
+
+    // Also check local_to_group for SSA versions of parameters
+    for (ssa_version, _) in &local_to_group {
+        // Check if this SSA version maps back to a parameter
+        for param in &function.parameters {
+            if ssa_version == param {
+                continue;  // Already in locals_to_ignore
+            }
+            // Check if they're in the same local group (meaning ssa_version is an SSA version of param)
+            if let (Some(&version_group), Some(&param_group)) = (local_to_group.get(ssa_version), local_to_group.get(param)) {
+                if version_group == param_group {
+                    locals_to_ignore.insert(ssa_version.clone());
+                }
+            }
+        }
+    }
+
+    // cfg::dot::render_to(&function, &mut std::io::stderr()).unwrap();
     ssa::Destructor::new(
         &mut function,
         upvalue_to_group,
@@ -209,11 +246,12 @@ fn decompile_function(
 
     let params = std::mem::take(&mut function.parameters);
     let is_variadic = function.is_variadic;
-    let block = Arc::new(restructure::lift(function).into());
+    let block: Arc<Mutex<ast::Block>> = Arc::new(restructure::lift(function).into());
+
     LocalDeclarer::default().declare_locals(
         // TODO: why does block.clone() not work?
         Arc::clone(&block),
-        &upvalues_in.iter().chain(params.iter()).cloned().collect(),
+        &locals_to_ignore,
     );
 
     {

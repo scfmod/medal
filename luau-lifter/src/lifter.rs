@@ -28,9 +28,10 @@ pub struct Lifter<'a> {
     blocks: FxHashMap<usize, NodeIndex>,
     function: Function,
     child_functions: FxHashMap<ByAddress<Arc<Mutex<ast::Function>>>, usize>,
-    register_map: FxHashMap<usize, ast::RcLocal>,
+    register_map: FxHashMap<(usize, usize), ast::RcLocal>,  // (register, pc) -> local
     constant_map: FxHashMap<usize, ast::Literal>,
     current_node: Option<NodeIndex>,
+    current_pc: usize,
     upvalues: Vec<ast::RcLocal>,
 }
 
@@ -53,6 +54,7 @@ impl<'a> Lifter<'a> {
             register_map: FxHashMap::default(),
             constant_map: FxHashMap::default(),
             current_node: None,
+            current_pc: 0,
             upvalues: Vec::new(),
         };
 
@@ -91,17 +93,93 @@ impl<'a> Lifter<'a> {
             )
             .1;
 
-        for _ in 0..self.function_list[self.function.id].num_upvalues {
-            self.upvalues.push(ast::RcLocal::default());
+        for i in 0..self.function_list[self.function.id].num_upvalues {
+            let bytecode_func = &self.function_list[self.function.id];
+            let upvalue = if let Some(&name_index) = bytecode_func.upvalue_debug_names.get(i as usize) {
+                if name_index > 0 {
+                    if let Some(name_bytes) = self.string_table.get(name_index - 1) {
+                        if let Ok(name) = String::from_utf8(name_bytes.clone()) {
+                            if !name.starts_with('(') {
+                                ast::RcLocal::new(ast::Local::new(Some(name)))
+                            } else {
+                                ast::RcLocal::default()
+                            }
+                        } else {
+                            ast::RcLocal::default()
+                        }
+                    } else {
+                        ast::RcLocal::default()
+                    }
+                } else {
+                    ast::RcLocal::default()
+                }
+            } else {
+                ast::RcLocal::default()
+            };
+            self.upvalues.push(upvalue);
         }
 
         for i in 0..self.function_list[self.function.id].num_parameters {
-            let parameter = ast::RcLocal::default();
+            // Try to get debug name for parameter
+            let bytecode_func = &self.function_list[self.function.id];
+            let parameter = if let Some(name_index) = bytecode_func.get_debug_name_for_register(i, 0) {
+                if name_index > 0 {
+                    if let Some(name_bytes) = self.string_table.get(name_index - 1) {
+                        if let Ok(name) = String::from_utf8(name_bytes.clone()) {
+                            if !name.starts_with('(') {
+                                ast::RcLocal::new(ast::Local::new(Some(name)))
+                            } else {
+                                ast::RcLocal::default()
+                            }
+                        } else {
+                            ast::RcLocal::default()
+                        }
+                    } else {
+                        ast::RcLocal::default()
+                    }
+                } else {
+                    ast::RcLocal::default()
+                }
+            } else {
+                ast::RcLocal::default()
+            };
             self.function.parameters.push(parameter.clone());
-            self.register_map.insert(i as usize, parameter);
+            // Parameters have scope_start = 0
+            self.register_map.insert((i as usize, 0), parameter);
         }
 
         self.function.is_variadic = self.function_list[self.function.id].is_vararg;
+
+        // Pre-populate register map with debug names for all registers that have them.
+        // This is necessary because CFG lifting doesn't process blocks in PC order,
+        // so a register might first be accessed at a PC outside its debug scope.
+        //
+        // We iterate through all debug entries and for each register, prefer the entry
+        // with a valid (non-compiler-generated) name. This handles cases where a register
+        // has multiple entries (e.g., one without a name and one with).
+        let bytecode_func = &self.function_list[self.function.id];
+
+        for info in &bytecode_func.local_debug_info {
+            let index = info.register as usize;
+            // Skip if already in map (e.g., parameters) - but only if it has a valid name
+            if let Some(existing) = self.register_map.get(&(index, 0)) {
+                if existing.name().is_some() {
+                    continue;
+                }
+            }
+            if info.name_index > 0 {
+                if let Some(name_bytes) = self.string_table.get(info.name_index - 1) {
+                    if let Ok(name) = String::from_utf8(name_bytes.clone()) {
+                        if !name.starts_with('(') {
+                            self.register_map.insert(
+                                (index, 0),
+                                ast::RcLocal::new(ast::Local::new(Some(name))),
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         for (start_pc, end_pc) in block_ranges {
             self.current_node = Some(self.block_to_node(start_pc));
@@ -256,6 +334,7 @@ impl<'a> Lifter<'a> {
             .enumerate();
 
         while let Some((index, instruction)) = iter.next() {
+            self.current_pc = block_start + index;
             match *instruction {
                 Instruction::BC {
                     op_code,
@@ -1303,7 +1382,31 @@ impl<'a> Lifter<'a> {
     }
 
     fn register(&mut self, index: usize) -> ast::RcLocal {
-        self.register_map.entry(index).or_default().clone()
+        // Try to get the debug name for this register at the current PC
+        let bytecode_func = &self.function_list[self.function.id];
+        let pc = self.current_pc;
+
+
+        self.register_map
+            .entry((index, 0))  // Use simple key - scope tracking breaks CFG lifting
+            .or_insert_with(|| {
+                // Try to get the debug name for this register from bytecode debug info
+                if let Some(name_index) = bytecode_func.get_debug_name_for_register(index as u8, pc) {
+                    // name_index is 1-based (0 means no name)
+                    if name_index > 0 {
+                        if let Some(name_bytes) = self.string_table.get(name_index - 1) {
+                            if let Ok(name) = String::from_utf8(name_bytes.clone()) {
+                                // Don't use debug names for compiler-generated names that start with '('
+                                if !name.starts_with('(') {
+                                    return ast::RcLocal::new(ast::Local::new(Some(name)));
+                                }
+                            }
+                        }
+                    }
+                }
+                ast::RcLocal::default()
+            })
+            .clone()
     }
 
     fn constant(&mut self, index: usize) -> ast::Literal {
