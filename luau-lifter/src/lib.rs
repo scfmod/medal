@@ -4,6 +4,7 @@ mod lifter;
 mod op_code;
 
 use ast::{
+    cleanup_for_statements::cleanup_for_statements, inline_temporaries::inline_temporaries,
     local_declarations::LocalDeclarer, name_locals::name_locals, replace_locals::replace_locals,
     Traverse,
 };
@@ -137,7 +138,9 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
             upvalues.remove(&main);
             let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
             link_upvalues(&mut body, &mut upvalues);
+            cleanup_for_statements(&mut body);
             name_locals(&mut body, true);
+            inline_temporaries(&mut body);
             body.to_string()
         }
     }
@@ -173,7 +176,13 @@ fn decompile_function(
     // etc.
     // the macro could also maybe generate an optimal ordering?
     let mut changed = true;
+    let mut iteration = 0;
     while changed {
+        iteration += 1;
+        if iteration > 100 {
+            // Safety limit to prevent infinite loops
+            break;
+        }
         changed = false;
 
         let dominators = simple_fast(function.graph(), function.entry().unwrap());
@@ -198,7 +207,7 @@ fn decompile_function(
         }
         ssa::construct::apply_local_map(&mut function, local_map);
     }
-    // cfg::dot::render_to(&function, &mut std::io::stdout()).unwrap();
+    // cfg::dot::render_to(&function, &mut std::io::stderr()).unwrap();
     ssa::Destructor::new(
         &mut function,
         upvalue_to_group,
@@ -209,7 +218,8 @@ fn decompile_function(
 
     let params = std::mem::take(&mut function.parameters);
     let is_variadic = function.is_variadic;
-    let block = Arc::new(restructure::lift(function).into());
+    let block: Arc<Mutex<ast::Block>> = Arc::new(restructure::lift(function).into());
+
     LocalDeclarer::default().declare_locals(
         // TODO: why does block.clone() not work?
         Arc::clone(&block),
