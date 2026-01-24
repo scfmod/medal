@@ -1,5 +1,4 @@
 #![feature(box_patterns)]
-#![feature(let_chains)]
 
 use derive_more::From;
 use enum_as_inner::EnumAsInner;
@@ -28,6 +27,8 @@ mod index;
 mod literal;
 mod local;
 //mod name_gen;
+pub mod cleanup_for_statements;
+pub mod inline_temporaries;
 pub mod local_declarations;
 pub mod name_locals;
 mod repeat;
