@@ -79,8 +79,13 @@ impl Inliner {
             if let Some((local, rvalue)) = self.extract_inline_candidate(&block[i]) {
                 if inline_candidates.contains(&local) {
                     if has_side_effects(&rvalue) {
-                        // Must inline into next statement only
-                        if i + 1 < block.len() && self.is_single_use(&local, &block[i + 1]) {
+                        // Must inline carefully for side-effect RValues.
+                        // We can inline if:
+                        // 1. The next statement(s) don't have side effects (they're just local assignments)
+                        // 2. We find a statement that uses this local exactly once
+                        // 3. No intervening statement writes to any local we read
+                        if let Some(_use_idx) = self.find_safe_inline_target(&local, &rvalue, block, i) {
+                            // Store for later inlining when we reach the target statement
                             self.immediate_inlines.insert(local.clone(), rvalue);
                             block.0.remove(i);
                             continue;
@@ -94,10 +99,15 @@ impl Inliner {
                 }
             }
 
+            // Note: we DON'T clear immediate_inlines here anymore - they persist
+            // until applied to a later statement in this block.
+            // Only clear deferred_inlines when recursing (different scope).
+
             // Recurse into nested blocks and closures, passing down protected locals
-            self.immediate_inlines.clear();
+            let saved_immediate = std::mem::take(&mut self.immediate_inlines);
             self.deferred_inlines.clear();
             self.recurse_into_statement(&mut block[i], depth, protected_locals);
+            self.immediate_inlines = saved_immediate;
 
             i += 1;
         }
@@ -373,7 +383,8 @@ impl Inliner {
         definitions
             .into_iter()
             .filter(|(local, (def_count, rvalue))| {
-                if *def_count != 1 || uses.get(local).copied().unwrap_or(0) != 1 {
+                let use_count = uses.get(local).copied().unwrap_or(0);
+                if *def_count != 1 || use_count != 1 {
                     return false;
                 }
 
@@ -394,7 +405,8 @@ impl Inliner {
                     return false;
                 }
 
-                let is_unnamed = local.name().map_or(false, |n| is_unnamed_temporary(&n));
+                // Unnamed temporaries: no name, or name matches v\d+_ pattern
+                let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
                 if is_unnamed {
                     return true;
                 }
@@ -462,20 +474,92 @@ impl Inliner {
         Some((local.clone(), assign.right[0].clone()))
     }
 
+    /// Find a safe target for inlining a side-effect-having RValue.
+    ///
+    /// For side-effect RValues (like calls), we can only inline if:
+    /// 1. Intervening statements don't have side effects (they're safe assignments)
+    /// 2. We find a statement that uses this local exactly once
+    /// 3. No intervening statement could observe or modify state affected by the RValue
+    ///
+    /// Returns the index of the safe target statement, if one exists.
+    fn find_safe_inline_target(
+        &self,
+        local: &RcLocal,
+        _rvalue: &RValue,
+        block: &Block,
+        start_idx: usize,
+    ) -> Option<usize> {
+        // Look for the first statement that uses this local
+        for j in (start_idx + 1)..block.len() {
+            let statement = &block[j];
+
+            // Check if this statement uses our local
+            if self.is_single_use(local, statement) {
+                return Some(j);
+            }
+
+            // Check if this is a safe intervening statement (side-effect-free assignment)
+            // Safe: local = <side-effect-free expression>
+            // Unsafe: anything with side effects (calls, etc.)
+            if let Statement::Assign(assign) = statement {
+                // Check if the RHS has side effects
+                let rhs_has_side_effects = assign.right.iter().any(|r| has_side_effects(r));
+                if rhs_has_side_effects {
+                    // Can't safely reorder past a side-effect statement
+                    return None;
+                }
+                // This is a safe intervening statement, continue looking
+            } else {
+                // Non-assignment statement - not safe to reorder past
+                return None;
+            }
+        }
+
+        // Didn't find a use
+        None
+    }
+
     /// Check if the local is used exactly once in the given statement
     fn is_single_use(&self, local: &RcLocal, statement: &Statement) -> bool {
         let reads = statement.values_read();
-        reads.iter().filter(|l| **l == local).count() == 1
+        // Compare by identity OR by name for SSA versions
+        let count = reads.iter().filter(|l| {
+            **l == local || (l.name().is_some() && l.name() == local.name())
+        }).count();
+        count == 1
     }
 
     /// Apply immediate inlines (for side-effect RValues)
+    ///
+    /// Only applies inlines for locals that are actually used in this statement.
     fn apply_immediate_inlines(&mut self, statement: &mut Statement) {
         if self.immediate_inlines.is_empty() {
             return;
         }
 
-        let inlines = std::mem::take(&mut self.immediate_inlines);
-        for (local, rvalue) in inlines {
+        // Find which locals are used in this statement
+        let reads = statement.values_read();
+        let mut to_apply = Vec::new();
+
+        for read_local in reads {
+            // Check if this local (by identity or name) is in our immediate_inlines
+            let mut found_key = None;
+            for (local, _) in &self.immediate_inlines {
+                let matches = local == read_local
+                    || (local.name().is_some() && local.name() == read_local.name());
+                if matches {
+                    found_key = Some(local.clone());
+                    break;
+                }
+            }
+            if let Some(key) = found_key {
+                if let Some(rvalue) = self.immediate_inlines.remove(&key) {
+                    to_apply.push((key, rvalue));
+                }
+            }
+        }
+
+        for (local, rvalue) in to_apply {
             self.replace_local_with_rvalue(statement, &local, rvalue);
         }
     }
@@ -797,7 +881,20 @@ fn extract_boolean_ternary(if_stat: &If) -> Option<(RcLocal, RValue)> {
         return Some(result);
     }
 
-    // Second try: general ternary with truthy then-value
+    // Second try: "or-pattern" - when then-value is the same as condition
+    // Pattern: if cond then x = cond else x = val end
+    // Becomes: x = cond or val
+    // This is a common Lua idiom for default values
+    if rvalues_equal(&if_stat.condition, then_value) {
+        let or_expr = RValue::Binary(crate::Binary::new(
+            if_stat.condition.clone(),
+            else_value.clone(),
+            BinaryOperation::Or,
+        ));
+        return Some((then_local.clone(), or_expr));
+    }
+
+    // Third try: general ternary with truthy then-value
     // Pattern: if cond then x = val1 else x = val2 end
     // Becomes: x = cond and val1 or val2
     // This is only safe when val1 is guaranteed truthy (non-nil, non-false)
@@ -952,6 +1049,33 @@ fn negate_condition(condition: &RValue) -> RValue {
 
     // Default: wrap in `not`
     RValue::Unary(Unary::new(condition.clone(), UnaryOperation::Not))
+}
+
+/// Check if two RValues are structurally equal.
+///
+/// For locals, compares by identity or by name (for SSA versions).
+/// For other types, uses standard equality.
+fn rvalues_equal(a: &RValue, b: &RValue) -> bool {
+    match (a, b) {
+        (RValue::Local(la), RValue::Local(lb)) => {
+            la == lb || (la.name().is_some() && la.name() == lb.name())
+        }
+        (RValue::Literal(la), RValue::Literal(lb)) => la == lb,
+        (RValue::Binary(ba), RValue::Binary(bb)) => {
+            ba.operation == bb.operation
+                && rvalues_equal(&ba.left, &bb.left)
+                && rvalues_equal(&ba.right, &bb.right)
+        }
+        (RValue::Unary(ua), RValue::Unary(ub)) => {
+            ua.operation == ub.operation && rvalues_equal(&ua.value, &ub.value)
+        }
+        (RValue::Index(ia), RValue::Index(ib)) => {
+            rvalues_equal(&ia.left, &ib.left) && rvalues_equal(&ia.right, &ib.right)
+        }
+        // For other complex types (Call, MethodCall, etc.), don't consider them equal
+        // This is conservative and avoids false positives
+        _ => false,
+    }
 }
 
 /// Simplify and-chain patterns.
