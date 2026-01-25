@@ -1412,6 +1412,51 @@ fn simplify_and_chains(block: &mut Block) {
             }
         }
 
+        // Check for expression-initialized and-chain pattern:
+        // local v = expr1
+        // if v then
+        //     v = false
+        //     if cond2 then
+        //         v = finalExpr
+        //     end
+        // end
+        // Becomes: v = expr1 and cond2 and finalExpr
+        // This handles patterns where the initial value is not just `false` but an expression
+        if !matches!(initial_value, RValue::Literal(Literal::Boolean(false))) {
+            if i + 1 < block.len() {
+                if let Some((conditions, final_expr)) = extract_expr_and_chain(&block[i + 1], &local) {
+                    if !conditions.is_empty() {
+                        // Build: expr1 and cond1 and cond2 and ... and finalExpr
+                        let mut combined = initial_value.clone();
+                        for cond in &conditions {
+                            combined = RValue::Binary(crate::Binary::new(
+                                combined,
+                                cond.clone(),
+                                BinaryOperation::And,
+                            ));
+                        }
+                        combined = RValue::Binary(crate::Binary::new(
+                            combined,
+                            final_expr,
+                            BinaryOperation::And,
+                        ));
+
+                        let Statement::Assign(assign) = &mut block[i] else {
+                            unreachable!()
+                        };
+                        assign.right[0] = combined;
+                        assign.prefix = is_prefix;
+
+                        // Remove the if statement
+                        block.0.remove(i + 1);
+
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Check for true initialization with conditional reassignment:
         // local v = true
         // if cond then
@@ -1716,6 +1761,79 @@ fn extract_nested_and_chain(
     }
 
     None
+}
+
+/// Extract the pattern for expression-initialized and-chain.
+///
+/// Pattern:
+/// ```lua
+/// local v = expr1    -- some expression (not just false)
+/// if v then          -- condition is the local itself
+///     v = false      -- reset to false
+///     if cond2 then
+///         v = finalExpr
+///     end
+/// end
+/// ```
+///
+/// Returns (conditions, final_expr) where conditions is [cond2, cond3, ...]
+/// (the outer "if v" is implicit since v = expr1 is used directly)
+fn extract_expr_and_chain(
+    statement: &Statement,
+    target_local: &RcLocal,
+) -> Option<(Vec<RValue>, RValue)> {
+    let if_stat = statement.as_if()?;
+
+    // Must have empty else branch
+    if !if_stat.else_block.lock().is_empty() {
+        return None;
+    }
+
+    // Condition must be the local itself: `if v then`
+    let cond_local = if_stat.condition.as_local()?;
+    let same = cond_local == target_local
+        || (cond_local.name().is_some() && cond_local.name() == target_local.name());
+    if !same {
+        return None;
+    }
+
+    let then_block = if_stat.then_block.lock();
+
+    // The then-block should have exactly 2 statements:
+    // 1. v = false (reset)
+    // 2. if cond2 then ... end (nested chain)
+    // We require exactly 2 to avoid issues with intermediate temporaries
+    if then_block.len() != 2 {
+        return None;
+    }
+
+    let mut statements = then_block.0.iter();
+
+    // First statement should be v = false
+    let first = statements.next()?;
+    if let Some(assign) = first.as_assign() {
+        if assign.left.len() == 1 && assign.right.len() == 1 {
+            if let Some(local) = assign.left[0].as_local() {
+                let same_local = local == target_local
+                    || (local.name().is_some() && local.name() == target_local.name());
+                if !same_local || !matches!(&assign.right[0], RValue::Literal(Literal::Boolean(false))) {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+
+    // Second statement should be a nested if
+    let second = statements.next()?;
+
+    // Extract from the nested if using the existing function
+    extract_nested_and_chain(second, target_local)
 }
 
 /// Extract the pattern for true initialization with conditional reassignment.
