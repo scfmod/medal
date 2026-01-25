@@ -765,12 +765,12 @@ impl Inliner {
                 return None;
             }
 
-            // For assignments, we allow continuing even if they have side effects,
-            // as long as they don't conflict with our RValue's reads
-            if let Statement::Assign(_) = statement {
-                // Continue looking
-            } else {
-                // Non-assignment statement (if, while, call, etc.) - not safe to reorder past
+            // For assignments, we allow continuing to look past them
+            // as long as they don't conflict with our RValue's reads.
+            // For other statements (if, while, call, etc.), we can't continue
+            // past them - but we already checked is_single_use above, so if
+            // we reach here, the local wasn't used in this statement.
+            if !matches!(statement, Statement::Assign(_)) {
                 return None;
             }
         }
