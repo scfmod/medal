@@ -1294,14 +1294,50 @@ fn simplify_and_chains(block: &mut Block) {
             continue;
         };
 
-        // Only simplify unnamed temporaries
+        let local = local.clone();
+        let initial_value = assign.right[0].clone();
+
+        // Check for nil-check field assignment pattern FIRST (works for all locals, not just unnamed):
+        // local v = expr
+        // if v ~= nil then
+        //     field = v
+        // end
+        // Becomes: field = expr or field
+        // This eliminates the local entirely, so it's safe even for named locals
+        if i + 1 < block.len() {
+            if let Some((field_lvalue, fallback)) =
+                extract_nil_check_field_assignment(&block[i + 1], &local)
+            {
+                // Transform to: field = expr or fallback
+                let combined = RValue::Binary(crate::Binary::new(
+                    initial_value.clone(),
+                    fallback,
+                    BinaryOperation::Or,
+                ));
+
+                // Replace the local assignment with field assignment
+                let Statement::Assign(assign) = &mut block[i] else {
+                    unreachable!()
+                };
+                assign.left[0] = field_lvalue;
+                assign.right[0] = combined;
+                assign.prefix = false; // Field assignments don't have local prefix
+
+                // Remove the if statement
+                block.0.remove(i + 1);
+
+                i += 1;
+                continue;
+            }
+        }
+
+        // Only simplify other patterns for unnamed temporaries
         let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
         if !is_unnamed {
             i += 1;
             continue;
         }
 
-        let local = local.clone();
         let is_prefix = assign.prefix;
 
         // Now look ahead for if-reassign patterns
@@ -1355,11 +1391,6 @@ fn simplify_and_chains(block: &mut Block) {
 
         // Check for or-chain pattern: local v = cond1; if not cond1 then v = cond2 end
         // This becomes: v = cond1 or cond2
-        let Statement::Assign(assign) = &block[i] else {
-            unreachable!()
-        };
-        let initial_value = assign.right[0].clone();
-
         if i + 1 < block.len() {
             if let Some(or_value) = is_or_chain_pattern(&block[i + 1], &local, &initial_value) {
                 // Transform to: v = initial_value or or_value
@@ -1635,6 +1666,105 @@ fn is_or_chain_pattern(
     }
 
     None
+}
+
+/// Extract nil-check field assignment pattern.
+///
+/// Pattern:
+/// ```lua
+/// local v = expr
+/// if v ~= nil then
+///     field = v
+/// end
+/// ```
+///
+/// Returns Some((field_lvalue, field_rvalue)) if pattern matches.
+/// The caller should transform this to: `field = expr or field`
+fn extract_nil_check_field_assignment(
+    statement: &Statement,
+    target_local: &RcLocal,
+) -> Option<(LValue, RValue)> {
+    let if_stat = statement.as_if()?;
+
+    // Must have empty else branch
+    if !if_stat.else_block.lock().is_empty() {
+        return None;
+    }
+
+    // Then branch must have exactly one assignment
+    let then_block = if_stat.then_block.lock();
+    if then_block.len() != 1 {
+        return None;
+    }
+
+    let then_assign = then_block[0].as_assign()?;
+
+    // Must be single assignment
+    if then_assign.left.len() != 1 || then_assign.right.len() != 1 {
+        return None;
+    }
+
+    // Left side must be a field (index), not a local
+    // e.g., self.colorDisabled
+    let field_lvalue = &then_assign.left[0];
+    if field_lvalue.as_local().is_some() {
+        // If assigning to a local, this is handled by other patterns
+        return None;
+    }
+
+    // Right side must be the target local
+    let rhs_local = then_assign.right[0].as_local()?;
+    let same = rhs_local == target_local
+        || (rhs_local.name().is_some() && rhs_local.name() == target_local.name());
+    if !same {
+        return None;
+    }
+
+    // Condition must be `v ~= nil` or `v` (truthy check)
+    // Check for `v ~= nil`
+    if let RValue::Binary(binary) = &if_stat.condition {
+        if binary.operation == BinaryOperation::NotEqual {
+            // Check if it's `local ~= nil` or `nil ~= local`
+            let is_nil_check = if let RValue::Local(left_local) = &*binary.left {
+                let same = left_local == target_local
+                    || (left_local.name().is_some() && left_local.name() == target_local.name());
+                same && matches!(&*binary.right, RValue::Literal(Literal::Nil))
+            } else if let RValue::Local(right_local) = &*binary.right {
+                let same = right_local == target_local
+                    || (right_local.name().is_some() && right_local.name() == target_local.name());
+                same && matches!(&*binary.left, RValue::Literal(Literal::Nil))
+            } else {
+                false
+            };
+
+            if is_nil_check {
+                // The fallback is reading the same field
+                let fallback = lvalue_to_rvalue(field_lvalue);
+                return Some((field_lvalue.clone(), fallback));
+            }
+        }
+    }
+
+    // Also check for simple truthy check: `if v then`
+    if let RValue::Local(cond_local) = &if_stat.condition {
+        let same = cond_local == target_local
+            || (cond_local.name().is_some() && cond_local.name() == target_local.name());
+        if same {
+            let fallback = lvalue_to_rvalue(field_lvalue);
+            return Some((field_lvalue.clone(), fallback));
+        }
+    }
+
+    None
+}
+
+/// Convert an LValue to an equivalent RValue for reading.
+fn lvalue_to_rvalue(lvalue: &LValue) -> RValue {
+    match lvalue {
+        LValue::Local(local) => RValue::Local(local.clone()),
+        LValue::Index(index) => RValue::Index(index.clone()),
+        LValue::Global(global) => RValue::Global(global.clone()),
+    }
 }
 
 /// Check if `condition` is the negation of `original`.
