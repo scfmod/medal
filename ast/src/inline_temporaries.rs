@@ -124,6 +124,11 @@ impl Inliner {
         self.immediate_inlines.clear();
         self.deferred_inlines.clear();
 
+        // Simplify __set_list patterns like:
+        // local v35_ = {}; __set_list(v35_, 1, {a, b, c}); return v35_
+        // Into: return {a, b, c}
+        simplify_set_list_patterns(block);
+
         // Coalesce reassignment patterns like:
         // local year = match(...); local v12_ = tonumber(year)
         // Into: local year = match(...); year = tonumber(year)
@@ -3122,6 +3127,181 @@ fn replace_local_in_rvalue(rvalue: &mut RValue, old: &RcLocal, new: &RcLocal) {
 /// ```lua
 /// local v28_, v29_
 /// v28_, rotY, v29_ = getWorldRotation(self.spot.node)
+/// Simplifies __set_list patterns where an empty table is created, populated via __set_list,
+/// and then immediately used (returned or assigned).
+///
+/// Pattern 1 - Return:
+/// ```lua
+/// local v35_ = {}
+/// __set_list(v35_, 1, {a, b, c})
+/// return v35_
+/// ```
+/// Becomes:
+/// ```lua
+/// return {a, b, c}
+/// ```
+///
+/// Pattern 2 - Assignment:
+/// ```lua
+/// local v1_ = {}
+/// __set_list(v1_, 1, {unpack(src.items)})
+/// self.items = v1_
+/// ```
+/// Becomes:
+/// ```lua
+/// self.items = {unpack(src.items)}
+/// ```
+fn simplify_set_list_patterns(block: &mut Block) {
+    // First recurse into nested blocks
+    for stmt in block.0.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                simplify_set_list_patterns(&mut if_stat.then_block.lock());
+                simplify_set_list_patterns(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                simplify_set_list_patterns(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                simplify_set_list_patterns(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                simplify_set_list_patterns(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                simplify_set_list_patterns(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Recurse into closures
+        for rvalue in stmt.rvalues_mut() {
+            simplify_set_list_in_closures(rvalue);
+        }
+    }
+
+    let mut i = 0;
+    while i + 2 < block.len() {
+        // Look for: local v = {}
+        let Some(assign1) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be single local = empty table
+        if assign1.left.len() != 1 || assign1.right.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        let Some(local) = assign1.left[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        // Right side must be empty table literal
+        let is_empty_table = matches!(&assign1.right[0], RValue::Table(tbl) if tbl.0.is_empty());
+        if !is_empty_table {
+            i += 1;
+            continue;
+        }
+
+        // Check if it's an unnamed temp
+        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+        if !is_unnamed {
+            i += 1;
+            continue;
+        }
+
+        // Look for: SetList statement (not a Call)
+        let Some(set_list) = block[i + 1].as_set_list() else {
+            i += 1;
+            continue;
+        };
+
+        // Check if the SetList target is our local
+        let same_local = &set_list.object_local == local
+            || (set_list.object_local.name().is_some() && set_list.object_local.name() == local.name());
+        if !same_local {
+            i += 1;
+            continue;
+        }
+
+        // Index should be 1
+        if set_list.index != 1 {
+            i += 1;
+            continue;
+        }
+
+        // Build the table from SetList values
+        // Table entries are (Option<RValue>, RValue) where None means array-style
+        let mut table_entries: Vec<(Option<RValue>, RValue)> = Vec::new();
+        for val in set_list.values.iter() {
+            table_entries.push((None, val.clone()));
+        }
+        // Handle tail (vararg-like multi-return) - also array-style
+        if let Some(tail) = &set_list.tail {
+            table_entries.push((None, tail.clone()));
+        }
+        let values_rvalue = RValue::Table(crate::Table(table_entries));
+
+        // Now check the third statement - either return v or target = v
+        // Pattern 1: return v
+        if let Some(ret) = block[i + 2].as_return() {
+            if ret.values.len() == 1 {
+                if let Some(ret_local) = ret.values[0].as_local() {
+                    let same = ret_local == local
+                        || (ret_local.name().is_some() && ret_local.name() == local.name());
+                    if same {
+                        // Transform: remove first two statements, change return to return {...}
+                        block.0.remove(i); // Remove local v = {}
+                        block.0.remove(i); // Remove SetList
+                        // Modify return
+                        if let Statement::Return(ret) = &mut block.0[i] {
+                            ret.values = vec![values_rvalue];
+                        }
+                        continue; // Don't increment i, check the new statement at this position
+                    }
+                }
+            }
+        }
+
+        // Pattern 2: target = v
+        if let Some(assign3) = block[i + 2].as_assign() {
+            if assign3.left.len() == 1 && assign3.right.len() == 1 {
+                if let Some(rhs_local) = assign3.right[0].as_local() {
+                    let same = rhs_local == local
+                        || (rhs_local.name().is_some() && rhs_local.name() == local.name());
+                    if same {
+                        // Transform: remove first two statements, change assignment RHS to {...}
+                        let target = assign3.left[0].clone();
+                        block.0.remove(i); // Remove local v = {}
+                        block.0.remove(i); // Remove SetList
+                        // Modify assignment
+                        if let Statement::Assign(assign) = &mut block.0[i] {
+                            assign.left = vec![target];
+                            assign.right = vec![values_rvalue];
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+}
+
+fn simplify_set_list_in_closures(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        simplify_set_list_patterns(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        simplify_set_list_in_closures(rv);
+    }
+}
+
 /// ```
 /// Into:
 /// ```lua
