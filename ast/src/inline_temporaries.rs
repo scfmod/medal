@@ -130,6 +130,17 @@ impl Inliner {
         self.immediate_inlines.clear();
         self.deferred_inlines.clear();
 
+        // Run simplify_and_chains again after inlining has removed intermediate temporaries
+        // This catches patterns like:
+        //   local v16_ = false
+        //   if math.abs(...) < 0.05 then v16_ = ... end
+        // which only become apparent after inlining collapses v17_ = math.abs(...) into the condition
+        simplify_and_chains(block);
+
+        // Inline single-use unnamed locals into return statements
+        // This handles cases like: local v16_ = expr; return v16_  →  return expr
+        inline_into_returns(block);
+
         // Simplify __set_list patterns like:
         // local v35_ = {}; __set_list(v35_, 1, {a, b, c}); return v35_
         // Into: return {a, b, c}
@@ -3242,6 +3253,128 @@ fn replace_local_in_rvalue(rvalue: &mut RValue, old: &RcLocal, new: &RcLocal) {
 
     for rv in rvalue.rvalues_mut() {
         replace_local_in_rvalue(rv, old, new);
+    }
+}
+
+/// Inline single-use unnamed locals into return statements.
+///
+/// Transforms:
+/// ```lua
+/// local v16_ = expr
+/// return v16_
+/// ```
+/// Into:
+/// ```lua
+/// return expr
+/// ```
+///
+/// This runs late in the pipeline to catch locals that were simplified
+/// by earlier passes (like simplify_and_chains).
+fn inline_into_returns(block: &mut Block) {
+    // First recurse into nested blocks and closures
+    for stmt in block.0.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                inline_into_returns(&mut if_stat.then_block.lock());
+                inline_into_returns(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                inline_into_returns(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                inline_into_returns(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                inline_into_returns(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                inline_into_returns(&mut for_stat.block.lock());
+            }
+            Statement::Assign(assign) => {
+                // Recurse into closures
+                for rv in &mut assign.right {
+                    inline_into_returns_in_rvalue(rv);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Look for pattern: local v = expr; return v
+    let mut i = 0;
+    while i + 1 < block.len() {
+        // Check for: local v = expr (single assignment)
+        let Some(assign) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be single local assignment with prefix (local declaration)
+        if !assign.prefix || assign.left.len() != 1 || assign.right.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        let Some(local) = assign.left[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        // Only unnamed temporaries
+        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+        if !is_unnamed {
+            i += 1;
+            continue;
+        }
+
+        // Check if next statement is: return v
+        let Some(ret) = block[i + 1].as_return() else {
+            i += 1;
+            continue;
+        };
+
+        // Must return exactly one value
+        if ret.values.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        // The returned value must be the local we just assigned
+        let Some(ret_local) = ret.values[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        let same_local = ret_local == local
+            || (ret_local.name().is_some() && ret_local.name() == local.name());
+
+        if !same_local {
+            i += 1;
+            continue;
+        }
+
+        // Transform: inline the expression into the return
+        let expr = assign.right[0].clone();
+
+        // Update the return statement
+        let Statement::Return(ret) = &mut block[i + 1] else {
+            unreachable!()
+        };
+        ret.values[0] = expr;
+
+        // Remove the local assignment
+        block.0.remove(i);
+        // Don't increment i since we removed the statement
+    }
+}
+
+fn inline_into_returns_in_rvalue(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        inline_into_returns(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        inline_into_returns_in_rvalue(rv);
     }
 }
 
