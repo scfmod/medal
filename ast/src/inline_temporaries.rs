@@ -110,6 +110,12 @@ impl Inliner {
             // Note: we DON'T clear immediate_inlines or deferred_inlines here anymore -
             // they persist until applied to a later statement in this block.
 
+            // Before recursing, apply any pending deferred inlines to the nested block(s).
+            // This allows side-effect-free values from the parent scope to be inlined into
+            // nested if/while/for blocks. Note: this modifies deferred_inlines (removing
+            // consumed entries), which is intentional.
+            self.apply_pending_deferred_to_nested(&mut block[i]);
+
             // Recurse into nested blocks and closures, passing down protected locals
             // Save and restore both maps so nested processing doesn't affect outer scope
             let saved_immediate = std::mem::take(&mut self.immediate_inlines);
@@ -124,10 +130,26 @@ impl Inliner {
         self.immediate_inlines.clear();
         self.deferred_inlines.clear();
 
+        // Run simplify_and_chains again after inlining has removed intermediate temporaries
+        // This catches patterns like:
+        //   local v16_ = false
+        //   if math.abs(...) < 0.05 then v16_ = ... end
+        // which only become apparent after inlining collapses v17_ = math.abs(...) into the condition
+        simplify_and_chains(block);
+
+        // Inline single-use unnamed locals into return statements
+        // This handles cases like: local v16_ = expr; return v16_  →  return expr
+        inline_into_returns(block);
+
         // Simplify __set_list patterns like:
         // local v35_ = {}; __set_list(v35_, 1, {a, b, c}); return v35_
         // Into: return {a, b, c}
         simplify_set_list_patterns(block);
+
+        // Collapse table field assignments into inline table literals:
+        // local v2_ = {}; v2_.FIELD1 = expr1; v2_.FIELD2 = expr2; target = v2_
+        // Into: target = {FIELD1 = expr1, FIELD2 = expr2}
+        collapse_table_field_assignments(block);
 
         // Coalesce reassignment patterns like:
         // local year = match(...); local v12_ = tonumber(year)
@@ -557,10 +579,18 @@ impl Inliner {
                     return false;
                 }
 
-                // Never inline locals that are ONLY read in nested blocks
-                // because deferred_inlines gets cleared when we recurse into nested blocks
+                // For locals only read in nested blocks:
+                // - Side-effect-free values CAN be inlined (we pass deferred_inlines to nested blocks)
+                // - Side-effect values CANNOT be inlined (would change execution order)
                 if current_uses == 0 && nested_uses > 0 {
-                    return false;
+                    if let Some(rv) = rvalue {
+                        if has_side_effects(rv) {
+                            return false;
+                        }
+                        // Side-effect-free, allow it to be a candidate
+                    } else {
+                        return false;
+                    }
                 }
 
                 // Unnamed temporaries: no name, or name matches v\d+_ pattern
@@ -740,12 +770,12 @@ impl Inliner {
                 return None;
             }
 
-            // For assignments, we allow continuing even if they have side effects,
-            // as long as they don't conflict with our RValue's reads
-            if let Statement::Assign(_) = statement {
-                // Continue looking
-            } else {
-                // Non-assignment statement (if, while, call, etc.) - not safe to reorder past
+            // For assignments, we allow continuing to look past them
+            // as long as they don't conflict with our RValue's reads.
+            // For other statements (if, while, call, etc.), we can't continue
+            // past them - but we already checked is_single_use above, so if
+            // we reach here, the local wasn't used in this statement.
+            if !matches!(statement, Statement::Assign(_)) {
                 return None;
             }
         }
@@ -896,6 +926,116 @@ impl Inliner {
                     .into_iter()
                     .map(|r| r as *mut RValue),
             );
+        }
+    }
+
+    /// Apply pending deferred inlines to nested blocks within a statement.
+    /// This is called before recursing into a statement to apply side-effect-free
+    /// values from the parent scope into nested if/while/for blocks.
+    fn apply_pending_deferred_to_nested(&mut self, statement: &mut Statement) {
+        if self.deferred_inlines.is_empty() {
+            return;
+        }
+
+        match statement {
+            Statement::If(r#if) => {
+                self.apply_deferred_inlines_to_nested_block(&mut r#if.then_block.lock());
+                self.apply_deferred_inlines_to_nested_block(&mut r#if.else_block.lock());
+            }
+            Statement::While(r#while) => {
+                self.apply_deferred_inlines_to_nested_block(&mut r#while.block.lock());
+            }
+            Statement::Repeat(repeat) => {
+                self.apply_deferred_inlines_to_nested_block(&mut repeat.block.lock());
+            }
+            Statement::NumericFor(nf) => {
+                self.apply_deferred_inlines_to_nested_block(&mut nf.block.lock());
+            }
+            Statement::GenericFor(gf) => {
+                self.apply_deferred_inlines_to_nested_block(&mut gf.block.lock());
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply pending deferred inlines to all statements in a nested block.
+    /// This is called before recursively processing a nested block so that
+    /// side-effect-free values from the parent scope can be inlined into the
+    /// nested block.
+    fn apply_deferred_inlines_to_nested_block(&mut self, block: &mut Block) {
+        if self.deferred_inlines.is_empty() {
+            return;
+        }
+
+        // Iterate through all statements in the block and apply pending inlines
+        for statement in block.0.iter_mut() {
+            self.apply_pending_deferred_inlines_recursive(statement);
+        }
+    }
+
+    /// Recursively apply pending deferred inlines to a statement and its nested blocks.
+    fn apply_pending_deferred_inlines_recursive(&mut self, statement: &mut Statement) {
+        if self.deferred_inlines.is_empty() {
+            return;
+        }
+
+        // Find locals from deferred_inlines that are used in this statement
+        let reads = statement.values_read();
+        let mut to_inline = Vec::new();
+
+        for local in reads {
+            // Look up in deferred_inlines using name-based matching for SSA versions
+            let mut found_key = None;
+            for (key, _) in self.deferred_inlines.iter() {
+                let matches = key == local
+                    || (key.name().is_some() && key.name() == local.name());
+                if matches {
+                    found_key = Some(key.clone());
+                    break;
+                }
+            }
+            if let Some(key) = found_key {
+                if let Some(rvalue) = self.deferred_inlines.remove(&key) {
+                    to_inline.push((local.clone(), rvalue));
+                }
+            }
+        }
+
+        for (local, rvalue) in to_inline {
+            self.replace_local_with_rvalue(statement, &local, rvalue);
+        }
+
+        // Recurse into nested blocks within this statement
+        match statement {
+            Statement::If(r#if) => {
+                for stmt in r#if.then_block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+                for stmt in r#if.else_block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::While(r#while) => {
+                for stmt in r#while.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::Repeat(repeat) => {
+                for stmt in repeat.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::NumericFor(nf) => {
+                for stmt in nf.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::GenericFor(gf) => {
+                for stmt in gf.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2031,6 +2171,65 @@ fn extract_nested_and_chain(
                 }
             }
         }
+    } else if remaining.len() == 2 {
+        // Handle pattern with intermediate local:
+        // local v5_ = expr
+        // v4_ = not v5_  (or some other expression using v5_)
+        //
+        // We inline the intermediate to get: v4_ = not expr
+        if let (Some(intermediate_assign), Some(final_assign)) =
+            (remaining[0].as_assign(), remaining[1].as_assign())
+        {
+            // Check intermediate is: local intermediate_ = expr
+            if intermediate_assign.left.len() == 1
+                && intermediate_assign.right.len() == 1
+                && intermediate_assign.prefix  // Must be a local declaration
+            {
+                if let Some(intermediate_local) = intermediate_assign.left[0].as_local() {
+                    // Check intermediate is an unnamed temp
+                    let is_unnamed_temp = intermediate_local
+                        .name()
+                        .map_or(true, |n| is_unnamed_temporary(&n));
+                    if is_unnamed_temp {
+                        // Check final is: target = expr_using_intermediate
+                        if final_assign.left.len() == 1 && final_assign.right.len() == 1 {
+                            if let Some(final_local) = final_assign.left[0].as_local() {
+                                let same_local = final_local == target_local
+                                    || (final_local.name().is_some()
+                                        && final_local.name() == target_local.name());
+                                if same_local {
+                                    // Check if the final assignment uses the intermediate local
+                                    let final_reads_intermediate = final_assign.right[0]
+                                        .values_read()
+                                        .iter()
+                                        .any(|l| {
+                                            *l == intermediate_local
+                                                || (l.name().is_some()
+                                                    && l.name() == intermediate_local.name())
+                                        });
+                                    if final_reads_intermediate {
+                                        // Inline the intermediate into the final expression
+                                        let mut final_expr = final_assign.right[0].clone();
+                                        inline_local_in_rvalue(
+                                            &mut final_expr,
+                                            intermediate_local,
+                                            &intermediate_assign.right[0],
+                                        );
+                                        // Don't match if final value is false
+                                        if !matches!(
+                                            &final_expr,
+                                            RValue::Literal(Literal::Boolean(false))
+                                        ) {
+                                            return Some((conditions, final_expr));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     None
@@ -3121,6 +3320,128 @@ fn replace_local_in_rvalue(rvalue: &mut RValue, old: &RcLocal, new: &RcLocal) {
     }
 }
 
+/// Inline single-use unnamed locals into return statements.
+///
+/// Transforms:
+/// ```lua
+/// local v16_ = expr
+/// return v16_
+/// ```
+/// Into:
+/// ```lua
+/// return expr
+/// ```
+///
+/// This runs late in the pipeline to catch locals that were simplified
+/// by earlier passes (like simplify_and_chains).
+fn inline_into_returns(block: &mut Block) {
+    // First recurse into nested blocks and closures
+    for stmt in block.0.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                inline_into_returns(&mut if_stat.then_block.lock());
+                inline_into_returns(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                inline_into_returns(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                inline_into_returns(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                inline_into_returns(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                inline_into_returns(&mut for_stat.block.lock());
+            }
+            Statement::Assign(assign) => {
+                // Recurse into closures
+                for rv in &mut assign.right {
+                    inline_into_returns_in_rvalue(rv);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Look for pattern: local v = expr; return v
+    let mut i = 0;
+    while i + 1 < block.len() {
+        // Check for: local v = expr (single assignment)
+        let Some(assign) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be single local assignment with prefix (local declaration)
+        if !assign.prefix || assign.left.len() != 1 || assign.right.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        let Some(local) = assign.left[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        // Only unnamed temporaries
+        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+        if !is_unnamed {
+            i += 1;
+            continue;
+        }
+
+        // Check if next statement is: return v
+        let Some(ret) = block[i + 1].as_return() else {
+            i += 1;
+            continue;
+        };
+
+        // Must return exactly one value
+        if ret.values.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        // The returned value must be the local we just assigned
+        let Some(ret_local) = ret.values[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        let same_local = ret_local == local
+            || (ret_local.name().is_some() && ret_local.name() == local.name());
+
+        if !same_local {
+            i += 1;
+            continue;
+        }
+
+        // Transform: inline the expression into the return
+        let expr = assign.right[0].clone();
+
+        // Update the return statement
+        let Statement::Return(ret) = &mut block[i + 1] else {
+            unreachable!()
+        };
+        ret.values[0] = expr;
+
+        // Remove the local assignment
+        block.0.remove(i);
+        // Don't increment i since we removed the statement
+    }
+}
+
+fn inline_into_returns_in_rvalue(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        inline_into_returns(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        inline_into_returns_in_rvalue(rv);
+    }
+}
+
 /// Simplify write-only locals to underscore placeholders.
 ///
 /// Transforms patterns like:
@@ -3199,12 +3520,11 @@ fn simplify_set_list_patterns(block: &mut Block) {
             continue;
         };
 
-        // Right side must be empty table literal
-        let is_empty_table = matches!(&assign1.right[0], RValue::Table(tbl) if tbl.0.is_empty());
-        if !is_empty_table {
+        // Right side must be a table literal (can be empty or have existing entries)
+        let Some(existing_table) = assign1.right[0].as_table() else {
             i += 1;
             continue;
-        }
+        };
 
         // Check if it's an unnamed temp
         let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
@@ -3233,9 +3553,11 @@ fn simplify_set_list_patterns(block: &mut Block) {
             continue;
         }
 
-        // Build the table from SetList values
+        // Build the merged table: existing entries + SetList values
         // Table entries are (Option<RValue>, RValue) where None means array-style
-        let mut table_entries: Vec<(Option<RValue>, RValue)> = Vec::new();
+        let mut table_entries: Vec<(Option<RValue>, RValue)> = existing_table.0.clone();
+
+        // Add SetList values as array-style entries
         for val in set_list.values.iter() {
             table_entries.push((None, val.clone()));
         }
@@ -3245,7 +3567,7 @@ fn simplify_set_list_patterns(block: &mut Block) {
         }
         let values_rvalue = RValue::Table(crate::Table(table_entries));
 
-        // Now check the third statement - either return v or target = v
+        // Now check the third statement - return v, target = v, or call(v)
         // Pattern 1: return v
         if let Some(ret) = block[i + 2].as_return() {
             if ret.values.len() == 1 {
@@ -3284,6 +3606,51 @@ fn simplify_set_list_patterns(block: &mut Block) {
                         }
                         continue;
                     }
+                }
+            }
+        }
+
+        // Pattern 3: call(v) or obj:method(v) where v is the only use of the local
+        // e.g., curve:addKeyframe(v25_)
+        // Get the arguments from the call statement (either Call or MethodCall)
+        let call_arguments: Option<&Vec<RValue>> = match &block[i + 2] {
+            Statement::Call(call) => Some(&call.arguments),
+            Statement::MethodCall(mcall) => Some(&mcall.arguments),
+            _ => None,
+        };
+
+        if let Some(args) = call_arguments {
+            // Check if the local appears exactly once in the call arguments
+            let mut local_arg_idx = None;
+            let mut found_count = 0;
+
+            for (idx, arg) in args.iter().enumerate() {
+                if let Some(arg_local) = arg.as_local() {
+                    let same = arg_local == local
+                        || (arg_local.name().is_some() && arg_local.name() == local.name());
+                    if same {
+                        local_arg_idx = Some(idx);
+                        found_count += 1;
+                    }
+                }
+            }
+
+            if found_count == 1 {
+                if let Some(arg_idx) = local_arg_idx {
+                    // Transform: remove first two statements, replace local in call with table
+                    block.0.remove(i); // Remove local v = {...}
+                    block.0.remove(i); // Remove SetList
+                    // Modify the call - replace the local argument with the table
+                    match &mut block.0[i] {
+                        Statement::Call(call) => {
+                            call.arguments[arg_idx] = values_rvalue;
+                        }
+                        Statement::MethodCall(mcall) => {
+                            mcall.arguments[arg_idx] = values_rvalue;
+                        }
+                        _ => unreachable!(),
+                    }
+                    continue;
                 }
             }
         }
@@ -3522,5 +3889,298 @@ fn collect_locals_read_in_rvalue(rvalue: &RValue, locals_read: &mut FxHashSet<Rc
 
     for rv in rvalue.rvalues() {
         collect_locals_read_in_rvalue(rv, locals_read);
+    }
+}
+
+/// Collapse table field assignments into inline table literals.
+///
+/// Transforms patterns like:
+/// ```lua
+/// local v2_ = {}
+/// v2_.PAST_PERIOD_COUNT = GS_IS_MOBILE_VERSION and 3 or 4
+/// v2_.LOAN_STEP = 5000
+/// InGameMenuStatisticsFrame.FINANCES = v2_
+/// ```
+/// Into:
+/// ```lua
+/// InGameMenuStatisticsFrame.FINANCES = {
+///     PAST_PERIOD_COUNT = GS_IS_MOBILE_VERSION and 3 or 4,
+///     LOAN_STEP = 5000
+/// }
+/// ```
+fn collapse_table_field_assignments(block: &mut Block) {
+    // First recurse into nested blocks
+    for stmt in block.0.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                collapse_table_field_assignments(&mut if_stat.then_block.lock());
+                collapse_table_field_assignments(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                collapse_table_field_assignments(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                collapse_table_field_assignments(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                collapse_table_field_assignments(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                collapse_table_field_assignments(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Recurse into closures
+        for rvalue in stmt.rvalues_mut() {
+            collapse_table_field_in_closures(rvalue);
+        }
+    }
+
+    let mut i = 0;
+    while i < block.len() {
+        // Look for: local v = {} or local v = {existing...}
+        // Extract and clone early to avoid borrow issues
+        let (local, initial_table_entries) = {
+            let Some(assign1) = block[i].as_assign() else {
+                i += 1;
+                continue;
+            };
+
+            // Must be single local = table
+            if assign1.left.len() != 1 || assign1.right.len() != 1 {
+                i += 1;
+                continue;
+            }
+
+            let Some(local) = assign1.left[0].as_local() else {
+                i += 1;
+                continue;
+            };
+
+            // Right side must be a table literal (can be empty or have existing entries)
+            let Some(initial_table) = assign1.right[0].as_table() else {
+                i += 1;
+                continue;
+            };
+
+            // Check if it's an unnamed temp
+            let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+            if !is_unnamed {
+                i += 1;
+                continue;
+            }
+
+            (local.clone(), initial_table.0.clone())
+        };
+
+        // Collect field assignments: v.FIELD = expr
+        // Allow intervening statements that don't reference our local
+        // Track indices of statements to remove (field assignments to our temp)
+        let mut field_assignments: Vec<(RValue, RValue)> = Vec::new();
+        let mut indices_to_remove: Vec<usize> = vec![i]; // Start with the table init
+        let mut j = i + 1;
+
+        // Helper to check if a statement references our local
+        let refs_local = |stmt: &Statement| -> bool {
+            // Check all locals read by this statement
+            for read_local in stmt.values_read() {
+                if read_local == &local
+                    || (read_local.name().is_some() && read_local.name() == local.name())
+                {
+                    return true;
+                }
+            }
+            // Check all locals written by this statement
+            for written_local in stmt.values_written() {
+                if written_local == &local
+                    || (written_local.name().is_some() && written_local.name() == local.name())
+                {
+                    return true;
+                }
+            }
+            false
+        };
+
+        while j < block.len() {
+            // Check if this is a field assignment to our local: v.FIELD = expr
+            let is_field_assignment = if let Some(assign) = block[j].as_assign() {
+                if assign.left.len() == 1 && assign.right.len() == 1 {
+                    if let Some(index) = assign.left[0].as_index() {
+                        if let Some(index_local) = index.left.as_local() {
+                            index_local == &local
+                                || (index_local.name().is_some() && index_local.name() == local.name())
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_field_assignment {
+                // Extract the field assignment
+                let assign = block[j].as_assign().unwrap();
+                let index = assign.left[0].as_index().unwrap();
+                let key = (*index.right).clone();
+                let value = assign.right[0].clone();
+                field_assignments.push((key, value));
+                indices_to_remove.push(j);
+                j += 1;
+                continue;
+            }
+
+            // Check if this statement references our local at all
+            if refs_local(&block[j]) {
+                // This statement uses our local - could be the final use or something else
+                break;
+            }
+
+            // This statement doesn't reference our local - skip over it
+            j += 1;
+        }
+
+        // Need at least one field assignment
+        if field_assignments.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Now look for the final use: target = v, or call(v), or obj:method(v)
+        if j >= block.len() {
+            i += 1;
+            continue;
+        }
+
+        // Build the new table: start with initial entries, then add field assignments
+        let build_table = || {
+            let mut table_entries: Vec<(Option<RValue>, RValue)> = initial_table_entries.clone();
+            for (key, value) in &field_assignments {
+                table_entries.push((Some(key.clone()), value.clone()));
+            }
+            RValue::Table(crate::Table(table_entries))
+        };
+
+        // Pattern 1: target = v (assignment)
+        if let Some(final_assign) = block[j].as_assign() {
+            if final_assign.left.len() == 1 && final_assign.right.len() == 1 {
+                if let Some(rhs_local) = final_assign.right[0].as_local() {
+                    let same = rhs_local == &local
+                        || (rhs_local.name().is_some() && rhs_local.name() == local.name());
+
+                    if same {
+                        let new_table = build_table();
+                        let target = final_assign.left[0].clone();
+
+                        // Also remove the final assignment (index j)
+                        indices_to_remove.push(j);
+
+                        // Remove statements in reverse order to preserve indices
+                        indices_to_remove.sort_unstable();
+                        indices_to_remove.reverse();
+                        for idx in &indices_to_remove {
+                            block.0.remove(*idx);
+                        }
+
+                        // Insert the collapsed assignment at position i
+                        block.0.insert(
+                            i,
+                            Statement::Assign(crate::Assign {
+                                left: vec![target],
+                                right: vec![new_table],
+                                prefix: false,
+                                parallel: false,
+                            }),
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Pattern 2: call(v) or obj:method(v) - function call with our local as argument
+        let call_arguments: Option<&mut Vec<RValue>> = match &mut block[j] {
+            Statement::Call(call) => Some(&mut call.arguments),
+            Statement::MethodCall(mcall) => Some(&mut mcall.arguments),
+            _ => None,
+        };
+
+        if let Some(args) = call_arguments {
+            // Find if our local appears exactly once in the arguments
+            let mut local_arg_idx = None;
+            let mut found_count = 0;
+
+            for (idx, arg) in args.iter().enumerate() {
+                if let Some(arg_local) = arg.as_local() {
+                    let same = arg_local == &local
+                        || (arg_local.name().is_some() && arg_local.name() == local.name());
+                    if same {
+                        local_arg_idx = Some(idx);
+                        found_count += 1;
+                    }
+                }
+            }
+
+            if found_count == 1 {
+                if let Some(arg_idx) = local_arg_idx {
+                    let new_table = build_table();
+
+                    // Remove statements in reverse order (don't remove the call at j)
+                    indices_to_remove.sort_unstable();
+                    indices_to_remove.reverse();
+                    for idx in &indices_to_remove {
+                        block.0.remove(*idx);
+                    }
+
+                    // Calculate new position of the call after removals
+                    let removed_before_j = indices_to_remove.iter().filter(|&&idx| idx < j).count();
+                    let new_call_pos = j - removed_before_j;
+
+                    // Modify the call's argument
+                    match &mut block[new_call_pos] {
+                        Statement::Call(call) => {
+                            call.arguments[arg_idx] = new_table;
+                        }
+                        Statement::MethodCall(mcall) => {
+                            mcall.arguments[arg_idx] = new_table;
+                        }
+                        _ => unreachable!(),
+                    }
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+}
+
+fn collapse_table_field_in_closures(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        collapse_table_field_assignments(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        collapse_table_field_in_closures(rv);
+    }
+}
+
+/// Inline a local variable reference with its value in an RValue tree.
+/// This is used to substitute intermediate temporaries in expressions.
+fn inline_local_in_rvalue(rvalue: &mut RValue, local: &RcLocal, replacement: &RValue) {
+    if let RValue::Local(l) = rvalue {
+        if l == local || (l.name().is_some() && l.name() == local.name()) {
+            *rvalue = replacement.clone();
+            return;
+        }
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        inline_local_in_rvalue(rv, local, replacement);
     }
 }
