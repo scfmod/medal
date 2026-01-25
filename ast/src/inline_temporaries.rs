@@ -2210,14 +2210,14 @@ fn collapse_multi_return_assignments(block: &mut Block) {
             continue;
         }
 
-        // All left-hand sides must be unnamed local temporaries
+        // Get all left-hand side locals
         let locals: Vec<_> = assign.left.iter()
             .filter_map(|lv| lv.as_local())
-            .filter(|l| l.name().map_or(true, |n| is_unnamed_temporary(&n)))
             .cloned()
             .collect();
 
         if locals.len() != assign.left.len() {
+            // Not all LHS are locals (could be globals/indexes)
             i += 1;
             continue;
         }
@@ -2234,60 +2234,85 @@ fn collapse_multi_return_assignments(block: &mut Block) {
             continue;
         }
 
-        // Now look ahead for consecutive single assignments that use each local exactly once
-        // in order: target1 = v1, target2 = v2, ...
-        // Skip locals named "_" as they're intentionally discarded and have no assignment.
+        // Check if there's at least one unnamed temporary that could be collapsed
+        let has_unnamed = locals.iter().any(|l| {
+            l.name().map_or(true, |n| is_unnamed_temporary(&n)) && l.name().as_deref() != Some("_")
+        });
+        if !has_unnamed {
+            i += 1;
+            continue;
+        }
+
+        // Now look ahead for consecutive single assignments that use each unnamed local.
+        // For named locals (not temporaries), keep them as-is.
+        // For "_" locals, keep them as "_".
         let num_locals = locals.len();
         let mut targets: Vec<LValue> = Vec::with_capacity(num_locals);
-        let mut matched_count = 0;
-        let mut stmt_offset = 0;  // Track actual statement offset (skipping _ locals)
+        let mut stmt_offset = 0;  // Track actual statement offset
+        let mut any_collapsed = false;
 
         for local in locals.iter() {
-            // Skip discarded locals (named "_") - they have no assignment to match
-            if local.name().as_deref() == Some("_") {
-                // Add a placeholder LValue for the discarded position
+            let is_discard = local.name().as_deref() == Some("_");
+            let is_unnamed_temp = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+
+            if is_discard {
+                // Keep "_" as-is
                 targets.push(LValue::Local(local.clone()));
-                matched_count += 1;
                 continue;
             }
 
+            if !is_unnamed_temp {
+                // Named local (not a temp) - keep it as-is in the result
+                targets.push(LValue::Local(local.clone()));
+                continue;
+            }
+
+            // Unnamed temporary - try to find a subsequent assignment to collapse
             let next_idx = i + 1 + stmt_offset;
             if next_idx >= block.len() {
-                break;
+                // No more statements - keep the temp as-is
+                targets.push(LValue::Local(local.clone()));
+                continue;
             }
 
             let Some(next_assign) = block[next_idx].as_assign() else {
-                break;
+                // Next statement isn't an assignment - keep the temp as-is
+                targets.push(LValue::Local(local.clone()));
+                continue;
             };
 
             // Must be single assignment: target = local
             if next_assign.left.len() != 1 || next_assign.right.len() != 1 {
-                break;
+                targets.push(LValue::Local(local.clone()));
+                continue;
             }
 
             // Right side must be this local
             let Some(rhs_local) = next_assign.right[0].as_local() else {
-                break;
+                targets.push(LValue::Local(local.clone()));
+                continue;
             };
 
             let same = rhs_local == local
                 || (rhs_local.name().is_some() && rhs_local.name() == local.name());
             if !same {
-                break;
+                targets.push(LValue::Local(local.clone()));
+                continue;
             }
 
+            // Found a match - collapse this position
             targets.push(next_assign.left[0].clone());
-            matched_count += 1;
-            stmt_offset += 1;  // Only increment for non-_ locals
+            stmt_offset += 1;
+            any_collapsed = true;
         }
 
-        // Only collapse if we matched ALL the locals
-        if matched_count != num_locals {
+        // Only proceed if we actually collapsed something
+        if !any_collapsed {
             i += 1;
             continue;
         }
 
-        // Count how many statements to remove (only non-_ locals have assignments)
+        // Count how many statements to remove
         let stmts_to_remove = stmt_offset;
 
         // Extract the call RValue
