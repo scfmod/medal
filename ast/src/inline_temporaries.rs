@@ -25,6 +25,8 @@ const MAX_DEPTH: usize = 100;
 pub fn inline_temporaries(block: &mut Block) {
     let mut inliner = Inliner::default();
     inliner.inline_block(block, 0, &FxHashSet::default());
+    // Remove dead stores (self-assignments, round-trip assignments) after inlining
+    remove_dead_stores(block);
 }
 
 #[derive(Default)]
@@ -591,10 +593,14 @@ impl Inliner {
     fn find_safe_inline_target(
         &self,
         local: &RcLocal,
-        _rvalue: &RValue,
+        rvalue: &RValue,
         block: &Block,
         start_idx: usize,
     ) -> Option<usize> {
+        // Collect locals that our RValue reads - we need to ensure no intervening
+        // statement writes to these
+        let rvalue_reads: FxHashSet<_> = rvalue.values_read().into_iter().cloned().collect();
+
         // Look for the first statement that uses this local
         for j in (start_idx + 1)..block.len() {
             let statement = &block[j];
@@ -604,19 +610,25 @@ impl Inliner {
                 return Some(j);
             }
 
-            // Check if this is a safe intervening statement (side-effect-free assignment)
-            // Safe: local = <side-effect-free expression>
-            // Unsafe: anything with side effects (calls, etc.)
-            if let Statement::Assign(assign) = statement {
-                // Check if the RHS has side effects
-                let rhs_has_side_effects = assign.right.iter().any(|r| has_side_effects(r));
-                if rhs_has_side_effects {
-                    // Can't safely reorder past a side-effect statement
-                    return None;
-                }
-                // This is a safe intervening statement, continue looking
+            // Check if this intervening statement conflicts with our RValue
+            // A statement conflicts if it writes to a local that our RValue reads
+            let writes = statement.values_written();
+            let conflicts = writes.iter().any(|w| {
+                rvalue_reads.contains(*w) ||
+                rvalue_reads.iter().any(|r| r.name().is_some() && r.name() == w.name())
+            });
+
+            if conflicts {
+                // Can't safely reorder past a statement that modifies our inputs
+                return None;
+            }
+
+            // For assignments, we allow continuing even if they have side effects,
+            // as long as they don't conflict with our RValue's reads
+            if let Statement::Assign(_) = statement {
+                // Continue looking
             } else {
-                // Non-assignment statement - not safe to reorder past
+                // Non-assignment statement (if, while, call, etc.) - not safe to reorder past
                 return None;
             }
         }
@@ -1538,12 +1550,28 @@ fn is_or_chain_pattern(
         return None;
     }
 
-    // Check if condition is the negation of initial_value
+    // Check if condition is the negation of initial_value OR negation of the local
     // Case 1: initial_value is `x == y` and condition is `x ~= y`
     // Case 2: initial_value is `x ~= y` and condition is `x == y`
     // Case 3: condition is `not initial_value`
+    // Case 4: condition is `not local` (the common case for field accesses)
     if is_negation_of(&if_stat.condition, initial_value) {
         return Some(then_assign.right[0].clone());
+    }
+
+    // Case 4: condition is `not local` where local is the target
+    // This handles: local v = x.y; if not v then v = z end
+    // => v = x.y or z
+    if let RValue::Unary(unary) = &if_stat.condition {
+        if unary.operation == UnaryOperation::Not {
+            if let RValue::Local(cond_local) = &*unary.value {
+                let same = cond_local == target_local
+                    || (cond_local.name().is_some() && cond_local.name() == target_local.name());
+                if same {
+                    return Some(then_assign.right[0].clone());
+                }
+            }
+        }
     }
 
     None
@@ -1890,5 +1918,189 @@ fn collapse_multi_return_in_rvalue(rvalue: &mut RValue) {
 
     for rv in rvalue.rvalues_mut() {
         collapse_multi_return_in_rvalue(rv);
+    }
+}
+
+/// Remove dead store patterns (no-op assignments).
+///
+/// Transforms patterns like:
+///   local v5_ = maxXi
+///   maxXi = v5_           -- dead store: assigns maxXi to itself via temp
+///
+/// Into:
+///   local v5_ = maxXi     -- kept (may be used elsewhere)
+///
+/// Also removes completely dead round-trip patterns:
+///   local v5_ = x
+///   x = v5_
+///   (where v5_ is only used in the assignment back to x)
+///
+/// And removes self-assignments:
+///   x = x
+pub fn remove_dead_stores(block: &mut Block) {
+    let mut remover = DeadStoreRemover::default();
+    remover.process_block(block);
+}
+
+#[derive(Default)]
+struct DeadStoreRemover {
+    // Track: temp -> (source_local, definition_index)
+    // When we see `temp = source`, we record it here
+    temp_sources: FxHashMap<RcLocal, (RcLocal, usize)>,
+}
+
+impl DeadStoreRemover {
+    fn process_block(&mut self, block: &mut Block) {
+        // First pass: collect temp assignments and identify dead stores
+        let mut to_remove: Vec<usize> = Vec::new();
+
+        // Clear tracking at block start
+        self.temp_sources.clear();
+
+        let mut i = 0;
+        while i < block.len() {
+            // Recurse into nested blocks first
+            match &mut block[i] {
+                Statement::If(if_stat) => {
+                    // Save state, process nested, restore
+                    let saved = std::mem::take(&mut self.temp_sources);
+                    self.process_block(&mut if_stat.then_block.lock());
+                    self.temp_sources.clear();
+                    self.process_block(&mut if_stat.else_block.lock());
+                    self.temp_sources = saved;
+                }
+                Statement::While(while_stat) => {
+                    let saved = std::mem::take(&mut self.temp_sources);
+                    self.process_block(&mut while_stat.block.lock());
+                    self.temp_sources = saved;
+                }
+                Statement::Repeat(repeat_stat) => {
+                    let saved = std::mem::take(&mut self.temp_sources);
+                    self.process_block(&mut repeat_stat.block.lock());
+                    self.temp_sources = saved;
+                }
+                Statement::NumericFor(for_stat) => {
+                    let saved = std::mem::take(&mut self.temp_sources);
+                    self.process_block(&mut for_stat.block.lock());
+                    self.temp_sources = saved;
+                }
+                Statement::GenericFor(for_stat) => {
+                    let saved = std::mem::take(&mut self.temp_sources);
+                    self.process_block(&mut for_stat.block.lock());
+                    self.temp_sources = saved;
+                }
+                _ => {}
+            }
+
+            // Process closures in RValues
+            for rvalue in block[i].rvalues_mut() {
+                self.process_closures_in_rvalue(rvalue);
+            }
+
+            // Check for self-assignment: x = x
+            if let Some(assign) = block[i].as_assign() {
+                if assign.left.len() == 1 && assign.right.len() == 1 {
+                    if let LValue::Local(lhs) = &assign.left[0] {
+                        if let RValue::Local(rhs) = &assign.right[0] {
+                            // Self-assignment check
+                            let same = lhs == rhs
+                                || (lhs.name().is_some() && lhs.name() == rhs.name());
+                            if same {
+                                to_remove.push(i);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check for round-trip dead store: temp = source; ... ; source = temp
+            if let Some(assign) = block[i].as_assign() {
+                if assign.left.len() == 1 && assign.right.len() == 1 {
+                    if let LValue::Local(lhs) = &assign.left[0] {
+                        if let RValue::Local(rhs) = &assign.right[0] {
+                            // Check if rhs is a temp that was assigned from lhs
+                            let found_source = self.find_temp_source(rhs);
+                            if let Some((source, _def_idx)) = found_source {
+                                // Check if lhs is the original source
+                                let same = &source == lhs
+                                    || (source.name().is_some() && source.name() == lhs.name());
+                                if same {
+                                    // This is a dead store: source = temp where temp came from source
+                                    to_remove.push(i);
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Track new temp assignments: temp = source
+            if let Some(assign) = block[i].as_assign() {
+                if assign.left.len() == 1 && assign.right.len() == 1 {
+                    if let LValue::Local(lhs) = &assign.left[0] {
+                        // Only track unnamed temporaries
+                        let is_unnamed = lhs.name().map_or(true, |n| is_unnamed_temporary(&n));
+                        if is_unnamed {
+                            if let RValue::Local(rhs) = &assign.right[0] {
+                                // Record: temp -> source
+                                self.temp_sources.insert(lhs.clone(), (rhs.clone(), i));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Invalidate temps that are reassigned
+            if let Some(assign) = block[i].as_assign() {
+                for lv in &assign.left {
+                    if let LValue::Local(local) = lv {
+                        // Remove any temp whose source is being reassigned
+                        self.temp_sources.retain(|_, (src, _)| {
+                            src != local
+                                && !(src.name().is_some() && src.name() == local.name())
+                        });
+                    }
+                }
+            }
+
+            i += 1;
+        }
+
+        // Remove dead stores in reverse order to preserve indices
+        for idx in to_remove.into_iter().rev() {
+            block.0.remove(idx);
+        }
+    }
+
+    fn find_temp_source(&self, temp: &RcLocal) -> Option<(RcLocal, usize)> {
+        // Look up by identity first
+        if let Some((src, idx)) = self.temp_sources.get(temp) {
+            return Some((src.clone(), *idx));
+        }
+        // Then by name for SSA versions
+        if let Some(name) = temp.name() {
+            for (t, (src, idx)) in &self.temp_sources {
+                if t.name().as_ref() == Some(&name) {
+                    return Some((src.clone(), *idx));
+                }
+            }
+        }
+        None
+    }
+
+    fn process_closures_in_rvalue(&mut self, rvalue: &mut RValue) {
+        if let RValue::Closure(closure) = rvalue {
+            // Closures have their own scope
+            let mut nested = DeadStoreRemover::default();
+            nested.process_block(&mut closure.function.lock().body);
+        }
+
+        for rv in rvalue.rvalues_mut() {
+            self.process_closures_in_rvalue(rv);
+        }
     }
 }
