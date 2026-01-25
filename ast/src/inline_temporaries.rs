@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{Block, LValue, LocalRw, RValue, RcLocal, Select, Statement, Traverse};
+use crate::{Block, LValue, LocalRw, RValue, RcLocal, Select, SideEffects, Statement, Traverse};
 
 /// Maximum recursion depth to prevent stack overflow
 const MAX_DEPTH: usize = 100;
@@ -27,6 +27,8 @@ pub fn inline_temporaries(block: &mut Block) {
     inliner.inline_block(block, 0, &FxHashSet::default());
     // Remove dead stores (self-assignments, round-trip assignments) after inlining
     remove_dead_stores(block);
+    // Remove dead locals (assigned but never read)
+    remove_dead_locals(block);
 }
 
 #[derive(Default)]
@@ -2500,6 +2502,168 @@ impl DeadStoreRemover {
         for rv in rvalue.rvalues_mut() {
             self.process_closures_in_rvalue(rv);
         }
+    }
+}
+
+/// Remove dead locals - locals that are assigned but never read.
+///
+/// This handles patterns like:
+/// ```lua
+/// local v8_ = numKeys   -- assigned but never read
+/// for i = 2, numKeys do -- uses numKeys directly, not v8_
+/// ```
+///
+/// The local `v8_` is completely dead and can be removed.
+pub fn remove_dead_locals(block: &mut Block) {
+    // First, collect all reads and writes across the entire block (including nested)
+    let mut reads: FxHashSet<RcLocal> = FxHashSet::default();
+    let mut writes: FxHashMap<RcLocal, Vec<usize>> = FxHashMap::default();
+
+    collect_local_usage(block, &mut reads, &mut writes, 0);
+
+    // Find locals that are written but never read
+    let dead_locals: FxHashSet<_> = writes.keys()
+        .filter(|local| {
+            // Only remove unnamed temporaries
+            local.name().map_or(true, |n| is_unnamed_temporary(&n))
+                && !reads.contains(*local)
+                // Also check by name for SSA versions
+                && !reads.iter().any(|r| r.name().is_some() && r.name() == local.name())
+        })
+        .cloned()
+        .collect();
+
+    if dead_locals.is_empty() {
+        return;
+    }
+
+    // Remove statements that only write to dead locals
+    remove_dead_local_assignments(block, &dead_locals);
+}
+
+fn collect_local_usage(
+    block: &Block,
+    reads: &mut FxHashSet<RcLocal>,
+    writes: &mut FxHashMap<RcLocal, Vec<usize>>,
+    base_index: usize,
+) {
+    for (i, stmt) in block.iter().enumerate() {
+        // Collect reads from this statement
+        for local in stmt.values_read() {
+            reads.insert(local.clone());
+        }
+
+        // Collect writes from this statement
+        for local in stmt.values_written() {
+            writes.entry(local.clone()).or_default().push(base_index + i);
+        }
+
+        // Recurse into nested blocks
+        match stmt {
+            Statement::If(if_stat) => {
+                collect_local_usage(&if_stat.then_block.lock(), reads, writes, 0);
+                collect_local_usage(&if_stat.else_block.lock(), reads, writes, 0);
+            }
+            Statement::While(while_stat) => {
+                // Condition is also a read
+                for local in while_stat.condition.values_read() {
+                    reads.insert(local.clone());
+                }
+                collect_local_usage(&while_stat.block.lock(), reads, writes, 0);
+            }
+            Statement::Repeat(repeat_stat) => {
+                for local in repeat_stat.condition.values_read() {
+                    reads.insert(local.clone());
+                }
+                collect_local_usage(&repeat_stat.block.lock(), reads, writes, 0);
+            }
+            Statement::NumericFor(for_stat) => {
+                collect_local_usage(&for_stat.block.lock(), reads, writes, 0);
+            }
+            Statement::GenericFor(for_stat) => {
+                collect_local_usage(&for_stat.block.lock(), reads, writes, 0);
+            }
+            _ => {}
+        }
+
+        // Recurse into closures
+        for rvalue in stmt.rvalues() {
+            collect_local_usage_in_rvalue(rvalue, reads, writes);
+        }
+    }
+}
+
+fn collect_local_usage_in_rvalue(
+    rvalue: &RValue,
+    reads: &mut FxHashSet<RcLocal>,
+    writes: &mut FxHashMap<RcLocal, Vec<usize>>,
+) {
+    if let RValue::Closure(closure) = rvalue {
+        collect_local_usage(&closure.function.lock().body, reads, writes, 0);
+    }
+
+    for rv in rvalue.rvalues() {
+        collect_local_usage_in_rvalue(rv, reads, writes);
+    }
+}
+
+fn remove_dead_local_assignments(block: &mut Block, dead_locals: &FxHashSet<RcLocal>) {
+    // Remove assignments to dead locals
+    block.retain(|stmt| {
+        if let Some(assign) = stmt.as_assign() {
+            // Check if this assignment ONLY writes to dead locals
+            // and the RHS has no side effects
+            if assign.left.len() == 1
+                && !assign.right.iter().any(|r| r.has_side_effects())
+            {
+                if let Some(local) = assign.left[0].as_local() {
+                    let is_dead = dead_locals.contains(local)
+                        || dead_locals.iter().any(|d| d.name().is_some() && d.name() == local.name());
+                    if is_dead {
+                        return false; // Remove this statement
+                    }
+                }
+            }
+        }
+        true
+    });
+
+    // Recurse into nested blocks
+    for stmt in block.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                remove_dead_local_assignments(&mut if_stat.then_block.lock(), dead_locals);
+                remove_dead_local_assignments(&mut if_stat.else_block.lock(), dead_locals);
+            }
+            Statement::While(while_stat) => {
+                remove_dead_local_assignments(&mut while_stat.block.lock(), dead_locals);
+            }
+            Statement::Repeat(repeat_stat) => {
+                remove_dead_local_assignments(&mut repeat_stat.block.lock(), dead_locals);
+            }
+            Statement::NumericFor(for_stat) => {
+                remove_dead_local_assignments(&mut for_stat.block.lock(), dead_locals);
+            }
+            Statement::GenericFor(for_stat) => {
+                remove_dead_local_assignments(&mut for_stat.block.lock(), dead_locals);
+            }
+            _ => {}
+        }
+
+        // Process closures
+        for rvalue in stmt.rvalues_mut() {
+            remove_dead_locals_in_closures(rvalue, dead_locals);
+        }
+    }
+}
+
+fn remove_dead_locals_in_closures(rvalue: &mut RValue, dead_locals: &FxHashSet<RcLocal>) {
+    if let RValue::Closure(closure) = rvalue {
+        remove_dead_local_assignments(&mut closure.function.lock().body, dead_locals);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        remove_dead_locals_in_closures(rv, dead_locals);
     }
 }
 
