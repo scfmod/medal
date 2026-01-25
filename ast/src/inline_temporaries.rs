@@ -122,6 +122,12 @@ impl Inliner {
         self.immediate_inlines.clear();
         self.deferred_inlines.clear();
 
+        // Coalesce reassignment patterns like:
+        // local year = match(...); local v12_ = tonumber(year)
+        // Into: local year = match(...); year = tonumber(year)
+        // (where year is only used once, in the tonumber call)
+        coalesce_reassignments(block);
+
         // Fix broken swap patterns like:
         // local temp = a; a = b; temp = b; b = a
         // Into: a, b = b, a
@@ -2626,4 +2632,232 @@ fn detect_broken_swap(stmts: &[Statement]) -> Option<(RcLocal, RcLocal)> {
 /// Check if two locals are equal (by identity or by name for SSA versions)
 fn locals_equal(a: &RcLocal, b: &RcLocal) -> bool {
     a == b || (a.name().is_some() && a.name() == b.name())
+}
+
+/// Coalesce reassignment patterns where an unnamed temporary is assigned the result
+/// of a call that takes a named variable as its only/first argument.
+///
+/// Pattern:
+/// ```lua
+/// local named = expr           -- (i) named variable with a real name
+/// local v12_ = call(named)     -- (j) unnamed temp assigned call result using named
+/// ... uses of v12_ ...
+/// ```
+///
+/// Transforms to:
+/// ```lua
+/// local named = expr
+/// named = call(named)          -- reassign to named instead of creating temp
+/// ... uses of named ...
+/// ```
+///
+/// This is useful for patterns like:
+/// ```lua
+/// local year = match(...)
+/// local v12_ = tonumber(year)
+/// ```
+/// Becoming:
+/// ```lua
+/// local year = match(...)
+/// year = tonumber(year)
+/// ```
+fn coalesce_reassignments(block: &mut Block) {
+    // First pass: identify candidates
+    // A candidate is: local temp = call(named) where:
+    // - temp is unnamed (starts with v followed by digits and _)
+    // - named has a real name
+    // - named is only used in this one place (the call argument)
+    // - the call has exactly one argument that is `named`
+
+    let mut replacements: Vec<(RcLocal, RcLocal)> = Vec::new(); // (temp, named) pairs
+    let mut statements_to_modify: Vec<usize> = Vec::new();
+
+    // Count uses of each named local in the block
+    let mut local_uses: FxHashMap<String, usize> = FxHashMap::default();
+    for stmt in block.iter() {
+        for local in stmt.values_read() {
+            if let Some(name) = local.name() {
+                if !is_unnamed_temporary(&name) {
+                    *local_uses.entry(name).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    for (i, stmt) in block.iter().enumerate() {
+        if let Some(assign) = stmt.as_assign() {
+            // Check: single assignment to an unnamed local
+            if assign.left.len() != 1 || assign.right.len() != 1 || !assign.prefix {
+                continue;
+            }
+
+            let temp = match assign.left[0].as_local() {
+                Some(l) => l,
+                None => continue,
+            };
+
+            // temp must be unnamed
+            let _temp_name = match temp.name() {
+                Some(n) if is_unnamed_temporary(&n) => n,
+                _ => continue,
+            };
+
+            // Right side must be a call or method call (may be wrapped in Select for multi-return)
+            let call_args = match &assign.right[0] {
+                RValue::Call(call) => &call.arguments,
+                RValue::MethodCall(mc) => &mc.arguments,
+                RValue::Select(Select::Call(call)) => &call.arguments,
+                RValue::Select(Select::MethodCall(mc)) => &mc.arguments,
+                _ => continue,
+            };
+
+            // Call must have at least one argument
+            if call_args.is_empty() {
+                continue;
+            }
+
+            // First argument must be a named local
+            let named = match call_args[0].as_local() {
+                Some(l) => l,
+                None => continue,
+            };
+
+            let named_name = match named.name() {
+                Some(n) if !is_unnamed_temporary(&n) => n,
+                _ => continue,
+            };
+
+            // Check if named is only used once in this block (in this call)
+            let uses = local_uses.get(&named_name).copied().unwrap_or(0);
+            if uses != 1 {
+                continue;
+            }
+
+            // This is a candidate for coalescing
+            replacements.push((temp.clone(), named.clone()));
+            statements_to_modify.push(i);
+        }
+    }
+
+    // Second pass: apply replacements
+    for (temp, named) in &replacements {
+        // Replace all uses of temp with named throughout the block
+        for stmt in block.iter_mut() {
+            replace_local_in_statement(stmt, temp, named);
+        }
+    }
+
+    // Third pass: change the assignment from "local temp = call(named)" to "named = call(named)"
+    for &i in &statements_to_modify {
+        if let Some(assign) = block[i].as_assign_mut() {
+            // Change left side from temp to named
+            if let Some((_, named)) = replacements.iter().find(|(t, _)| {
+                assign.left[0].as_local().map(|l| l == t).unwrap_or(false)
+            }) {
+                assign.left[0] = named.clone().into();
+                assign.prefix = false; // No longer a local declaration
+            }
+        }
+    }
+
+    // Recurse into nested blocks
+    for stmt in block.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                coalesce_reassignments(&mut if_stat.then_block.lock());
+                coalesce_reassignments(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                coalesce_reassignments(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                coalesce_reassignments(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                coalesce_reassignments(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                coalesce_reassignments(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Process closures
+        for rvalue in stmt.rvalues_mut() {
+            coalesce_reassignments_in_closures(rvalue);
+        }
+    }
+}
+
+fn coalesce_reassignments_in_closures(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        coalesce_reassignments(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        coalesce_reassignments_in_closures(rv);
+    }
+}
+
+/// Replace all occurrences of `old` local with `new` local in a statement
+fn replace_local_in_statement(stmt: &mut Statement, old: &RcLocal, new: &RcLocal) {
+    // Replace in values read
+    for local in stmt.values_read_mut() {
+        if local == old || (local.name().is_some() && local.name() == old.name()) {
+            *local = new.clone();
+        }
+    }
+
+    // Replace in nested rvalues
+    for rvalue in stmt.rvalues_mut() {
+        replace_local_in_rvalue(rvalue, old, new);
+    }
+
+    // Recurse into nested statements
+    match stmt {
+        Statement::If(if_stat) => {
+            replace_local_in_rvalue(&mut if_stat.condition, old, new);
+            for s in if_stat.then_block.lock().iter_mut() {
+                replace_local_in_statement(s, old, new);
+            }
+            for s in if_stat.else_block.lock().iter_mut() {
+                replace_local_in_statement(s, old, new);
+            }
+        }
+        Statement::While(while_stat) => {
+            replace_local_in_rvalue(&mut while_stat.condition, old, new);
+            for s in while_stat.block.lock().iter_mut() {
+                replace_local_in_statement(s, old, new);
+            }
+        }
+        Statement::Repeat(repeat_stat) => {
+            replace_local_in_rvalue(&mut repeat_stat.condition, old, new);
+            for s in repeat_stat.block.lock().iter_mut() {
+                replace_local_in_statement(s, old, new);
+            }
+        }
+        Statement::NumericFor(for_stat) => {
+            for s in for_stat.block.lock().iter_mut() {
+                replace_local_in_statement(s, old, new);
+            }
+        }
+        Statement::GenericFor(for_stat) => {
+            for s in for_stat.block.lock().iter_mut() {
+                replace_local_in_statement(s, old, new);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_local_in_rvalue(rvalue: &mut RValue, old: &RcLocal, new: &RcLocal) {
+    if let RValue::Local(local) = rvalue {
+        if local == old || (local.name().is_some() && local.name() == old.name()) {
+            *local = new.clone();
+        }
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        replace_local_in_rvalue(rv, old, new);
+    }
 }
