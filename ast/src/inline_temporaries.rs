@@ -142,7 +142,103 @@ impl Inliner {
     fn inline_iterator_into_for_loops(&self, block: &mut Block) {
         // First handle numeric for loops
         self.inline_into_numeric_for_loops(block);
-        // Then handle generic for loops (existing logic below)
+        // Then handle generic for loops
+        // Look for patterns like:
+        //   local v1, v2, v3 = pairs(x)
+        //   [intervening safe statements]
+        //   for k, v in v1, v2, v3 do
+        let mut i = 0;
+        while i < block.len() {
+            // Check if statement i is an assignment with iterator call
+            let (is_iterator_assign, assign_locals) = if let Statement::Assign(assign) = &block[i] {
+                let is_iterator_call = assign.right.len() == 1
+                    && matches!(&assign.right[0],
+                        RValue::Call(_) | RValue::Select(Select::Call(_)) |
+                        RValue::MethodCall(_) | RValue::Select(Select::MethodCall(_)));
+                if is_iterator_call && assign.left.len() >= 1 {
+                    // Collect the local names being assigned
+                    let locals: Vec<_> = assign.left.iter()
+                        .filter_map(|lv| lv.as_local())
+                        .filter_map(|l| l.name())
+                        .collect();
+                    if locals.len() == assign.left.len() {
+                        (true, locals)
+                    } else {
+                        (false, vec![])
+                    }
+                } else {
+                    (false, vec![])
+                }
+            } else {
+                (false, vec![])
+            };
+
+            if !is_iterator_assign {
+                i += 1;
+                continue;
+            }
+
+            // Look ahead for a GenericFor that uses these locals
+            let mut for_idx = None;
+            for j in (i + 1)..block.len() {
+                if let Statement::GenericFor(generic_for) = &block[j] {
+                    // Check if this for-loop uses exactly our assigned locals
+                    if generic_for.right.len() == assign_locals.len() {
+                        let matches = generic_for.right.iter().zip(&assign_locals).all(|(rv, expected_name)| {
+                            if let RValue::Local(for_local) = rv {
+                                for_local.name().as_ref() == Some(expected_name)
+                            } else {
+                                false
+                            }
+                        });
+                        if matches {
+                            for_idx = Some(j);
+                            break;
+                        }
+                    }
+                }
+                // Check if intervening statement uses our locals (would make reordering unsafe)
+                // Only allow simple local assignments that don't reference our iterator locals
+                if let Statement::Assign(intervening) = &block[j] {
+                    let reads_our_locals = intervening.right.iter().any(|rv| {
+                        rv.values_read().iter().any(|l| {
+                            assign_locals.iter().any(|n| l.name().as_ref() == Some(n))
+                        })
+                    });
+                    if reads_our_locals {
+                        break; // Can't move past this
+                    }
+                    // Continue looking
+                } else {
+                    // Non-assignment statement - not safe to look past
+                    break;
+                }
+            }
+
+            if let Some(for_idx) = for_idx {
+                // Found the for-loop! Move the iterator call to just before it
+                if for_idx > i + 1 {
+                    // Need to move the statement - remove and reinsert
+                    let stmt = block.0.remove(i);
+                    block.0.insert(for_idx - 1, stmt);
+                    // Don't increment i since we removed at i
+                    continue;
+                } else {
+                    // Already adjacent, do the inline
+                    let Statement::Assign(assign) = block.0.remove(i) else {
+                        unreachable!()
+                    };
+                    if let Statement::GenericFor(generic_for) = &mut block[i] {
+                        generic_for.right = assign.right;
+                    }
+                    continue;
+                }
+            }
+
+            i += 1;
+        }
+
+        // Second pass: do the actual inlining for adjacent pairs
         let mut i = 0;
         while i + 1 < block.len() {
             // Check if statement i is an assignment and i+1 is a GenericFor
@@ -152,9 +248,6 @@ impl Inliner {
             ) = (&block[i], &block[i + 1])
             {
                 // The assignment must have a call as its RHS (like pairs() or ipairs())
-                // and the for-loop must use exactly the assigned locals
-                // Note: calls that return multiple values are wrapped in Select::Call
-                // Also include MethodCall for things like xmlFile:iterator()
                 let is_iterator_call = assign.right.len() == 1
                     && matches!(&assign.right[0],
                         RValue::Call(_) | RValue::Select(Select::Call(_)) |
