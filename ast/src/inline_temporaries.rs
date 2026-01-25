@@ -1031,7 +1031,22 @@ fn extract_boolean_ternary(if_stat: &If) -> Option<(RcLocal, RValue)> {
         return Some((then_local.clone(), or_expr));
     }
 
-    // Third try: general ternary with truthy then-value
+    // Third try: "and-pattern" - when else-value is the same as condition
+    // Pattern: if cond then x = val else x = cond end
+    // Becomes: x = cond and val
+    // This works because:
+    // - If cond is truthy: cond and val = val (correct)
+    // - If cond is falsy: cond and val = cond (short-circuits to the falsy value)
+    if rvalues_equal(&if_stat.condition, else_value) {
+        let and_expr = RValue::Binary(crate::Binary::new(
+            if_stat.condition.clone(),
+            then_value.clone(),
+            BinaryOperation::And,
+        ));
+        return Some((then_local.clone(), and_expr));
+    }
+
+    // Fourth try: general ternary with truthy then-value
     // Pattern: if cond then x = val1 else x = val2 end
     // Becomes: x = cond and val1 or val2
     // This is only safe when val1 is guaranteed truthy (non-nil, non-false)
