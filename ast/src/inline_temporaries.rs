@@ -128,6 +128,11 @@ impl Inliner {
         // (where year is only used once, in the tonumber call)
         coalesce_reassignments(block);
 
+        // Simplify write-only locals to underscores:
+        // local v28_, v29_; v28_, rotY, v29_ = getWorldRotation(...)
+        // Into: _, rotY, _ = getWorldRotation(...)
+        simplify_write_only_locals(block);
+
         // Fix broken swap patterns like:
         // local temp = a; a = b; temp = b; b = a
         // Into: a, b = b, a
@@ -2859,5 +2864,234 @@ fn replace_local_in_rvalue(rvalue: &mut RValue, old: &RcLocal, new: &RcLocal) {
 
     for rv in rvalue.rvalues_mut() {
         replace_local_in_rvalue(rv, old, new);
+    }
+}
+
+/// Simplify write-only locals to underscore placeholders.
+///
+/// Transforms patterns like:
+/// ```lua
+/// local v28_, v29_
+/// v28_, rotY, v29_ = getWorldRotation(self.spot.node)
+/// ```
+/// Into:
+/// ```lua
+/// _, rotY, _ = getWorldRotation(self.spot.node)
+/// ```
+///
+/// This works by:
+/// 1. Finding empty local declarations (prefix assignment with no RHS)
+/// 2. Looking for the next assignment that writes to those locals
+/// 3. Checking if those locals are never read in the entire block
+/// 4. If so, removing the declaration and replacing the locals with underscore
+fn simplify_write_only_locals(block: &mut Block) {
+    // First, collect all locals that are read anywhere in the block
+    let mut locals_read: FxHashSet<RcLocal> = FxHashSet::default();
+    collect_locals_read(block, &mut locals_read);
+
+    let mut i = 0;
+    while i < block.len() {
+        // Look for empty local declarations: `local v28_, v29_`
+        let Some(assign) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        if !assign.prefix || !assign.right.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Collect the declared locals
+        let declared_locals: Vec<RcLocal> = assign.left.iter()
+            .filter_map(|lv| lv.as_local().cloned())
+            .collect();
+
+        if declared_locals.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Check if ALL declared locals are unnamed temporaries and never read
+        let all_write_only = declared_locals.iter().all(|local| {
+            let is_unnamed = local.name()
+                .map(|n| is_unnamed_temporary(&n))
+                .unwrap_or(true);
+            let never_read = !locals_read.contains(local);
+            is_unnamed && never_read
+        });
+
+        if !all_write_only {
+            i += 1;
+            continue;
+        }
+
+        // Look for the next statement that assigns to these locals
+        if i + 1 >= block.len() {
+            i += 1;
+            continue;
+        }
+
+        let Some(next_assign) = block[i + 1].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // The next assignment should not be a prefix (not a local declaration)
+        if next_assign.prefix {
+            i += 1;
+            continue;
+        }
+
+        // Check if this assignment writes to any of our declared locals
+        let writes_to_declared: Vec<usize> = next_assign.left.iter()
+            .enumerate()
+            .filter_map(|(idx, lv)| {
+                lv.as_local().and_then(|l| {
+                    if declared_locals.iter().any(|dl| dl == l) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        if writes_to_declared.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Create the underscore local
+        let underscore = RcLocal::new(crate::Local::new(Some("_".to_string())));
+
+        // Replace the write-only locals with underscore in the assignment
+        if let Some(next_assign) = block[i + 1].as_assign_mut() {
+            for &idx in &writes_to_declared {
+                if let Some(local) = next_assign.left[idx].as_local() {
+                    if declared_locals.iter().any(|dl| dl == local) {
+                        next_assign.left[idx] = underscore.clone().into();
+                    }
+                }
+            }
+        }
+
+        // Remove the empty declaration if all its locals are now replaced
+        let all_replaced = declared_locals.iter().all(|dl| {
+            writes_to_declared.iter().any(|&idx| {
+                block[i + 1].as_assign()
+                    .and_then(|a| a.left.get(idx))
+                    .and_then(|lv| lv.as_local())
+                    .map(|l| l.name() == Some("_".to_string()))
+                    .unwrap_or(false)
+            }) || !block[i + 1].as_assign()
+                .map(|a| a.left.iter().any(|lv| lv.as_local().map(|l| l == dl).unwrap_or(false)))
+                .unwrap_or(false)
+        });
+
+        if all_replaced {
+            block.0.remove(i);
+            // Don't increment i, we need to check the same position again
+        } else {
+            i += 1;
+        }
+    }
+
+    // Recurse into nested blocks
+    for stmt in block.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                simplify_write_only_locals(&mut if_stat.then_block.lock());
+                simplify_write_only_locals(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                simplify_write_only_locals(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                simplify_write_only_locals(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                simplify_write_only_locals(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                simplify_write_only_locals(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Process closures
+        for rvalue in stmt.rvalues_mut() {
+            simplify_write_only_locals_in_closures(rvalue);
+        }
+    }
+}
+
+fn simplify_write_only_locals_in_closures(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        simplify_write_only_locals(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        simplify_write_only_locals_in_closures(rv);
+    }
+}
+
+/// Collect all locals that are read in a block (recursively)
+fn collect_locals_read(block: &Block, locals_read: &mut FxHashSet<RcLocal>) {
+    for stmt in block.iter() {
+        // Collect locals that are read (not written)
+        for local in stmt.values_read() {
+            locals_read.insert(local.clone());
+        }
+
+        // Recurse into nested blocks
+        match stmt {
+            Statement::If(if_stat) => {
+                // The condition reads values
+                for local in if_stat.condition.values_read() {
+                    locals_read.insert(local.clone());
+                }
+                collect_locals_read(&if_stat.then_block.lock(), locals_read);
+                collect_locals_read(&if_stat.else_block.lock(), locals_read);
+            }
+            Statement::While(while_stat) => {
+                for local in while_stat.condition.values_read() {
+                    locals_read.insert(local.clone());
+                }
+                collect_locals_read(&while_stat.block.lock(), locals_read);
+            }
+            Statement::Repeat(repeat_stat) => {
+                for local in repeat_stat.condition.values_read() {
+                    locals_read.insert(local.clone());
+                }
+                collect_locals_read(&repeat_stat.block.lock(), locals_read);
+            }
+            Statement::NumericFor(for_stat) => {
+                collect_locals_read(&for_stat.block.lock(), locals_read);
+            }
+            Statement::GenericFor(for_stat) => {
+                collect_locals_read(&for_stat.block.lock(), locals_read);
+            }
+            _ => {}
+        }
+
+        // Process closures
+        for rvalue in stmt.rvalues() {
+            collect_locals_read_in_rvalue(rvalue, locals_read);
+        }
+    }
+}
+
+fn collect_locals_read_in_rvalue(rvalue: &RValue, locals_read: &mut FxHashSet<RcLocal>) {
+    if let RValue::Local(local) = rvalue {
+        locals_read.insert(local.clone());
+    }
+
+    if let RValue::Closure(closure) = rvalue {
+        collect_locals_read(&closure.function.lock().body, locals_read);
+    }
+
+    for rv in rvalue.rvalues() {
+        collect_locals_read_in_rvalue(rv, locals_read);
     }
 }
