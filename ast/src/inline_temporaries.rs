@@ -3880,35 +3880,40 @@ fn collapse_table_field_assignments(block: &mut Block) {
 
     let mut i = 0;
     while i < block.len() {
-        // Look for: local v = {}
-        let Some(assign1) = block[i].as_assign() else {
-            i += 1;
-            continue;
+        // Look for: local v = {} or local v = {existing...}
+        // Extract and clone early to avoid borrow issues
+        let (local, initial_table_entries) = {
+            let Some(assign1) = block[i].as_assign() else {
+                i += 1;
+                continue;
+            };
+
+            // Must be single local = table
+            if assign1.left.len() != 1 || assign1.right.len() != 1 {
+                i += 1;
+                continue;
+            }
+
+            let Some(local) = assign1.left[0].as_local() else {
+                i += 1;
+                continue;
+            };
+
+            // Right side must be a table literal (can be empty or have existing entries)
+            let Some(initial_table) = assign1.right[0].as_table() else {
+                i += 1;
+                continue;
+            };
+
+            // Check if it's an unnamed temp
+            let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+            if !is_unnamed {
+                i += 1;
+                continue;
+            }
+
+            (local.clone(), initial_table.0.clone())
         };
-
-        // Must be single local = empty table
-        if assign1.left.len() != 1 || assign1.right.len() != 1 {
-            i += 1;
-            continue;
-        }
-
-        let Some(local) = assign1.left[0].as_local() else {
-            i += 1;
-            continue;
-        };
-
-        // Right side must be a table literal (can be empty or have existing entries)
-        let Some(initial_table) = assign1.right[0].as_table() else {
-            i += 1;
-            continue;
-        };
-
-        // Check if it's an unnamed temp
-        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
-        if !is_unnamed {
-            i += 1;
-            continue;
-        }
 
         // Collect consecutive field assignments: v.FIELD = expr
         // We need at least one field assignment for this optimization to make sense
@@ -3935,7 +3940,7 @@ fn collapse_table_field_assignments(block: &mut Block) {
                 break;
             };
 
-            let same_local = index_local == local
+            let same_local = index_local == &local
                 || (index_local.name().is_some() && index_local.name() == local.name());
 
             if !same_local {
@@ -3957,65 +3962,103 @@ fn collapse_table_field_assignments(block: &mut Block) {
             continue;
         }
 
-        // Now look for the final assignment: target = v
+        // Now look for the final use: target = v, or call(v), or obj:method(v)
         if j >= block.len() {
             i += 1;
             continue;
         }
 
-        let Some(final_assign) = block[j].as_assign() else {
-            i += 1;
-            continue;
-        };
-
-        // Final assignment must be: target = v (single assignment with our local on RHS)
-        if final_assign.left.len() != 1 || final_assign.right.len() != 1 {
-            i += 1;
-            continue;
-        }
-
-        let Some(rhs_local) = final_assign.right[0].as_local() else {
-            i += 1;
-            continue;
-        };
-
-        let same = rhs_local == local
-            || (rhs_local.name().is_some() && rhs_local.name() == local.name());
-
-        if !same {
-            i += 1;
-            continue;
-        }
-
         // Build the new table: start with initial entries, then add field assignments
-        let mut table_entries: Vec<(Option<RValue>, RValue)> = initial_table.0.clone();
-        for (key, value) in field_assignments {
-            table_entries.push((Some(key), value));
+        let build_table = || {
+            let mut table_entries: Vec<(Option<RValue>, RValue)> = initial_table_entries.clone();
+            for (key, value) in &field_assignments {
+                table_entries.push((Some(key.clone()), value.clone()));
+            }
+            RValue::Table(crate::Table(table_entries))
+        };
+
+        // Pattern 1: target = v (assignment)
+        if let Some(final_assign) = block[j].as_assign() {
+            if final_assign.left.len() == 1 && final_assign.right.len() == 1 {
+                if let Some(rhs_local) = final_assign.right[0].as_local() {
+                    let same = rhs_local == &local
+                        || (rhs_local.name().is_some() && rhs_local.name() == local.name());
+
+                    if same {
+                        let new_table = build_table();
+                        let target = final_assign.left[0].clone();
+
+                        // Remove all statements from i to j (inclusive)
+                        let stmts_to_remove = j - i + 1;
+                        for _ in 0..stmts_to_remove {
+                            block.0.remove(i);
+                        }
+
+                        // Insert the collapsed assignment: target = {fields...}
+                        block.0.insert(
+                            i,
+                            Statement::Assign(crate::Assign {
+                                left: vec![target],
+                                right: vec![new_table],
+                                prefix: false,
+                                parallel: false,
+                            }),
+                        );
+                        continue;
+                    }
+                }
+            }
         }
 
-        let new_table = RValue::Table(crate::Table(table_entries));
-        let target = final_assign.left[0].clone();
+        // Pattern 2: call(v) or obj:method(v) - function call with our local as argument
+        let call_arguments: Option<&mut Vec<RValue>> = match &mut block[j] {
+            Statement::Call(call) => Some(&mut call.arguments),
+            Statement::MethodCall(mcall) => Some(&mut mcall.arguments),
+            _ => None,
+        };
 
-        // Remove all statements from i to j (inclusive)
-        // That's: local v = {}, all field assignments, and target = v
-        let stmts_to_remove = j - i + 1;
-        for _ in 0..stmts_to_remove {
-            block.0.remove(i);
+        if let Some(args) = call_arguments {
+            // Find if our local appears exactly once in the arguments
+            let mut local_arg_idx = None;
+            let mut found_count = 0;
+
+            for (idx, arg) in args.iter().enumerate() {
+                if let Some(arg_local) = arg.as_local() {
+                    let same = arg_local == &local
+                        || (arg_local.name().is_some() && arg_local.name() == local.name());
+                    if same {
+                        local_arg_idx = Some(idx);
+                        found_count += 1;
+                    }
+                }
+            }
+
+            if found_count == 1 {
+                if let Some(arg_idx) = local_arg_idx {
+                    let new_table = build_table();
+
+                    // Remove all statements from i to j-1 (keep the call, modify it)
+                    let stmts_to_remove = j - i;
+                    for _ in 0..stmts_to_remove {
+                        block.0.remove(i);
+                    }
+
+                    // Now the call is at position i, modify its argument
+                    match &mut block[i] {
+                        Statement::Call(call) => {
+                            call.arguments[arg_idx] = new_table;
+                        }
+                        Statement::MethodCall(mcall) => {
+                            mcall.arguments[arg_idx] = new_table;
+                        }
+                        _ => unreachable!(),
+                    }
+                    continue;
+                }
+            }
         }
 
-        // Insert the collapsed assignment: target = {fields...}
-        block.0.insert(
-            i,
-            Statement::Assign(crate::Assign {
-                left: vec![target],
-                right: vec![new_table],
-                prefix: false,
-                parallel: false,
-            }),
-        );
-
-        // Don't increment i - check the new statement at this position
-        // (it might be part of another pattern)
+        i += 1;
     }
 }
 
