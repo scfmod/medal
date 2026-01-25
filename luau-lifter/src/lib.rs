@@ -62,6 +62,58 @@ struct Args {
     verbose: bool,
 }
 
+/// Dump bytecode instructions for debugging
+pub fn dump_bytecode(bytecode: &[u8], encode_key: u8, func_name: Option<&str>) {
+    use deserializer::bytecode::Bytecode;
+    let chunk = deserializer::deserialize(bytecode, encode_key).unwrap();
+    match chunk {
+        Bytecode::Error(msg) => eprintln!("Error: {}", msg),
+        Bytecode::Chunk(chunk) => {
+            for (func_id, func) in chunk.functions.iter().enumerate() {
+                // Get function name from string table
+                let name = if func.function_name > 0 && func.function_name <= chunk.string_table.len() {
+                    String::from_utf8_lossy(&chunk.string_table[func.function_name - 1]).to_string()
+                } else {
+                    format!("function_{}", func_id)
+                };
+
+                // Filter by function name if specified
+                if let Some(filter) = func_name {
+                    if !name.contains(filter) {
+                        continue;
+                    }
+                }
+
+                println!("\n=== Function {} ({}) ===", func_id, name);
+                println!("Parameters: {}, Stack: {}, Upvalues: {}, Vararg: {}",
+                    func.num_parameters, func.max_stack_size, func.num_upvalues, func.is_vararg);
+                println!("Instructions:");
+
+                for (pc, insn) in func.instructions.iter().enumerate() {
+                    println!("  {:4}: {:?}", pc, insn);
+                }
+
+                println!("\nConstants:");
+                for (i, constant) in func.constants.iter().enumerate() {
+                    println!("  K{}: {:?}", i, constant);
+                }
+
+                if !func.local_debug_info.is_empty() {
+                    println!("\nLocal Debug Info:");
+                    for info in &func.local_debug_info {
+                        let name = if info.name_index > 0 && info.name_index <= chunk.string_table.len() {
+                            String::from_utf8_lossy(&chunk.string_table[info.name_index - 1]).to_string()
+                        } else {
+                            "(no name)".to_string()
+                        };
+                        println!("  R{}: \"{}\" (PC {}-{})", info.register, name, info.scope_start, info.scope_end);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
     let chunk = deserializer::deserialize(bytecode, encode_key).unwrap();
     match chunk {
