@@ -3456,12 +3456,11 @@ fn simplify_set_list_patterns(block: &mut Block) {
             continue;
         };
 
-        // Right side must be empty table literal
-        let is_empty_table = matches!(&assign1.right[0], RValue::Table(tbl) if tbl.0.is_empty());
-        if !is_empty_table {
+        // Right side must be a table literal (can be empty or have existing entries)
+        let Some(existing_table) = assign1.right[0].as_table() else {
             i += 1;
             continue;
-        }
+        };
 
         // Check if it's an unnamed temp
         let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
@@ -3490,9 +3489,11 @@ fn simplify_set_list_patterns(block: &mut Block) {
             continue;
         }
 
-        // Build the table from SetList values
+        // Build the merged table: existing entries + SetList values
         // Table entries are (Option<RValue>, RValue) where None means array-style
-        let mut table_entries: Vec<(Option<RValue>, RValue)> = Vec::new();
+        let mut table_entries: Vec<(Option<RValue>, RValue)> = existing_table.0.clone();
+
+        // Add SetList values as array-style entries
         for val in set_list.values.iter() {
             table_entries.push((None, val.clone()));
         }
@@ -3502,7 +3503,7 @@ fn simplify_set_list_patterns(block: &mut Block) {
         }
         let values_rvalue = RValue::Table(crate::Table(table_entries));
 
-        // Now check the third statement - either return v or target = v
+        // Now check the third statement - return v, target = v, or call(v)
         // Pattern 1: return v
         if let Some(ret) = block[i + 2].as_return() {
             if ret.values.len() == 1 {
@@ -3541,6 +3542,51 @@ fn simplify_set_list_patterns(block: &mut Block) {
                         }
                         continue;
                     }
+                }
+            }
+        }
+
+        // Pattern 3: call(v) or obj:method(v) where v is the only use of the local
+        // e.g., curve:addKeyframe(v25_)
+        // Get the arguments from the call statement (either Call or MethodCall)
+        let call_arguments: Option<&Vec<RValue>> = match &block[i + 2] {
+            Statement::Call(call) => Some(&call.arguments),
+            Statement::MethodCall(mcall) => Some(&mcall.arguments),
+            _ => None,
+        };
+
+        if let Some(args) = call_arguments {
+            // Check if the local appears exactly once in the call arguments
+            let mut local_arg_idx = None;
+            let mut found_count = 0;
+
+            for (idx, arg) in args.iter().enumerate() {
+                if let Some(arg_local) = arg.as_local() {
+                    let same = arg_local == local
+                        || (arg_local.name().is_some() && arg_local.name() == local.name());
+                    if same {
+                        local_arg_idx = Some(idx);
+                        found_count += 1;
+                    }
+                }
+            }
+
+            if found_count == 1 {
+                if let Some(arg_idx) = local_arg_idx {
+                    // Transform: remove first two statements, replace local in call with table
+                    block.0.remove(i); // Remove local v = {...}
+                    block.0.remove(i); // Remove SetList
+                    // Modify the call - replace the local argument with the table
+                    match &mut block.0[i] {
+                        Statement::Call(call) => {
+                            call.arguments[arg_idx] = values_rvalue;
+                        }
+                        Statement::MethodCall(mcall) => {
+                            mcall.arguments[arg_idx] = values_rvalue;
+                        }
+                        _ => unreachable!(),
+                    }
+                    continue;
                 }
             }
         }
