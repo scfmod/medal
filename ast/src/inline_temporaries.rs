@@ -3915,44 +3915,74 @@ fn collapse_table_field_assignments(block: &mut Block) {
             (local.clone(), initial_table.0.clone())
         };
 
-        // Collect consecutive field assignments: v.FIELD = expr
-        // We need at least one field assignment for this optimization to make sense
+        // Collect field assignments: v.FIELD = expr
+        // Allow intervening statements that don't reference our local
+        // Track indices of statements to remove (field assignments to our temp)
         let mut field_assignments: Vec<(RValue, RValue)> = Vec::new();
+        let mut indices_to_remove: Vec<usize> = vec![i]; // Start with the table init
         let mut j = i + 1;
 
+        // Helper to check if a statement references our local
+        let refs_local = |stmt: &Statement| -> bool {
+            // Check all locals read by this statement
+            for read_local in stmt.values_read() {
+                if read_local == &local
+                    || (read_local.name().is_some() && read_local.name() == local.name())
+                {
+                    return true;
+                }
+            }
+            // Check all locals written by this statement
+            for written_local in stmt.values_written() {
+                if written_local == &local
+                    || (written_local.name().is_some() && written_local.name() == local.name())
+                {
+                    return true;
+                }
+            }
+            false
+        };
+
         while j < block.len() {
-            let Some(field_assign) = block[j].as_assign() else {
-                break;
+            // Check if this is a field assignment to our local: v.FIELD = expr
+            let is_field_assignment = if let Some(assign) = block[j].as_assign() {
+                if assign.left.len() == 1 && assign.right.len() == 1 {
+                    if let Some(index) = assign.left[0].as_index() {
+                        if let Some(index_local) = index.left.as_local() {
+                            index_local == &local
+                                || (index_local.name().is_some() && index_local.name() == local.name())
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
             };
 
-            // Must be single assignment
-            if field_assign.left.len() != 1 || field_assign.right.len() != 1 {
+            if is_field_assignment {
+                // Extract the field assignment
+                let assign = block[j].as_assign().unwrap();
+                let index = assign.left[0].as_index().unwrap();
+                let key = (*index.right).clone();
+                let value = assign.right[0].clone();
+                field_assignments.push((key, value));
+                indices_to_remove.push(j);
+                j += 1;
+                continue;
+            }
+
+            // Check if this statement references our local at all
+            if refs_local(&block[j]) {
+                // This statement uses our local - could be the final use or something else
                 break;
             }
 
-            // LHS must be v.FIELD (Index with our local on the left)
-            let Some(index) = field_assign.left[0].as_index() else {
-                break;
-            };
-
-            // The index left side must be our local
-            let Some(index_local) = index.left.as_local() else {
-                break;
-            };
-
-            let same_local = index_local == &local
-                || (index_local.name().is_some() && index_local.name() == local.name());
-
-            if !same_local {
-                break;
-            }
-
-            // The index right side should be a string literal (for named fields)
-            // or could be any expression (for computed keys)
-            let key = (*index.right).clone();
-            let value = field_assign.right[0].clone();
-
-            field_assignments.push((key, value));
+            // This statement doesn't reference our local - skip over it
             j += 1;
         }
 
@@ -3988,13 +4018,17 @@ fn collapse_table_field_assignments(block: &mut Block) {
                         let new_table = build_table();
                         let target = final_assign.left[0].clone();
 
-                        // Remove all statements from i to j (inclusive)
-                        let stmts_to_remove = j - i + 1;
-                        for _ in 0..stmts_to_remove {
-                            block.0.remove(i);
+                        // Also remove the final assignment (index j)
+                        indices_to_remove.push(j);
+
+                        // Remove statements in reverse order to preserve indices
+                        indices_to_remove.sort_unstable();
+                        indices_to_remove.reverse();
+                        for idx in &indices_to_remove {
+                            block.0.remove(*idx);
                         }
 
-                        // Insert the collapsed assignment: target = {fields...}
+                        // Insert the collapsed assignment at position i
                         block.0.insert(
                             i,
                             Statement::Assign(crate::Assign {
@@ -4037,14 +4071,19 @@ fn collapse_table_field_assignments(block: &mut Block) {
                 if let Some(arg_idx) = local_arg_idx {
                     let new_table = build_table();
 
-                    // Remove all statements from i to j-1 (keep the call, modify it)
-                    let stmts_to_remove = j - i;
-                    for _ in 0..stmts_to_remove {
-                        block.0.remove(i);
+                    // Remove statements in reverse order (don't remove the call at j)
+                    indices_to_remove.sort_unstable();
+                    indices_to_remove.reverse();
+                    for idx in &indices_to_remove {
+                        block.0.remove(*idx);
                     }
 
-                    // Now the call is at position i, modify its argument
-                    match &mut block[i] {
+                    // Calculate new position of the call after removals
+                    let removed_before_j = indices_to_remove.iter().filter(|&&idx| idx < j).count();
+                    let new_call_pos = j - removed_before_j;
+
+                    // Modify the call's argument
+                    match &mut block[new_call_pos] {
                         Statement::Call(call) => {
                             call.arguments[arg_idx] = new_table;
                         }
