@@ -2171,6 +2171,65 @@ fn extract_nested_and_chain(
                 }
             }
         }
+    } else if remaining.len() == 2 {
+        // Handle pattern with intermediate local:
+        // local v5_ = expr
+        // v4_ = not v5_  (or some other expression using v5_)
+        //
+        // We inline the intermediate to get: v4_ = not expr
+        if let (Some(intermediate_assign), Some(final_assign)) =
+            (remaining[0].as_assign(), remaining[1].as_assign())
+        {
+            // Check intermediate is: local intermediate_ = expr
+            if intermediate_assign.left.len() == 1
+                && intermediate_assign.right.len() == 1
+                && intermediate_assign.prefix  // Must be a local declaration
+            {
+                if let Some(intermediate_local) = intermediate_assign.left[0].as_local() {
+                    // Check intermediate is an unnamed temp
+                    let is_unnamed_temp = intermediate_local
+                        .name()
+                        .map_or(true, |n| is_unnamed_temporary(&n));
+                    if is_unnamed_temp {
+                        // Check final is: target = expr_using_intermediate
+                        if final_assign.left.len() == 1 && final_assign.right.len() == 1 {
+                            if let Some(final_local) = final_assign.left[0].as_local() {
+                                let same_local = final_local == target_local
+                                    || (final_local.name().is_some()
+                                        && final_local.name() == target_local.name());
+                                if same_local {
+                                    // Check if the final assignment uses the intermediate local
+                                    let final_reads_intermediate = final_assign.right[0]
+                                        .values_read()
+                                        .iter()
+                                        .any(|l| {
+                                            *l == intermediate_local
+                                                || (l.name().is_some()
+                                                    && l.name() == intermediate_local.name())
+                                        });
+                                    if final_reads_intermediate {
+                                        // Inline the intermediate into the final expression
+                                        let mut final_expr = final_assign.right[0].clone();
+                                        inline_local_in_rvalue(
+                                            &mut final_expr,
+                                            intermediate_local,
+                                            &intermediate_assign.right[0],
+                                        );
+                                        // Don't match if final value is false
+                                        if !matches!(
+                                            &final_expr,
+                                            RValue::Literal(Literal::Boolean(false))
+                                        ) {
+                                            return Some((conditions, final_expr));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     None
@@ -4108,5 +4167,20 @@ fn collapse_table_field_in_closures(rvalue: &mut RValue) {
 
     for rv in rvalue.rvalues_mut() {
         collapse_table_field_in_closures(rv);
+    }
+}
+
+/// Inline a local variable reference with its value in an RValue tree.
+/// This is used to substitute intermediate temporaries in expressions.
+fn inline_local_in_rvalue(rvalue: &mut RValue, local: &RcLocal, replacement: &RValue) {
+    if let RValue::Local(l) = rvalue {
+        if l == local || (l.name().is_some() && l.name() == local.name()) {
+            *rvalue = replacement.clone();
+            return;
+        }
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        inline_local_in_rvalue(rv, local, replacement);
     }
 }
