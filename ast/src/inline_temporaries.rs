@@ -77,7 +77,11 @@ impl Inliner {
 
             // Check if this statement defines an inline candidate
             if let Some((local, rvalue)) = self.extract_inline_candidate(&block[i]) {
-                if inline_candidates.contains(&local) {
+                // Use name-based comparison for SSA versions
+                let is_candidate = inline_candidates.contains(&local)
+                    || inline_candidates.iter().any(|c| c.name().is_some() && c.name() == local.name());
+
+                if is_candidate {
                     if has_side_effects(&rvalue) {
                         // Must inline carefully for side-effect RValues.
                         // We can inline if:
@@ -99,15 +103,16 @@ impl Inliner {
                 }
             }
 
-            // Note: we DON'T clear immediate_inlines here anymore - they persist
-            // until applied to a later statement in this block.
-            // Only clear deferred_inlines when recursing (different scope).
+            // Note: we DON'T clear immediate_inlines or deferred_inlines here anymore -
+            // they persist until applied to a later statement in this block.
 
             // Recurse into nested blocks and closures, passing down protected locals
+            // Save and restore both maps so nested processing doesn't affect outer scope
             let saved_immediate = std::mem::take(&mut self.immediate_inlines);
-            self.deferred_inlines.clear();
+            let saved_deferred = std::mem::take(&mut self.deferred_inlines);
             self.recurse_into_statement(&mut block[i], depth, protected_locals);
             self.immediate_inlines = saved_immediate;
+            self.deferred_inlines = saved_deferred;
 
             i += 1;
         }
@@ -320,13 +325,16 @@ impl Inliner {
     fn find_inline_candidates(&self, block: &Block, protected_locals: &FxHashSet<RcLocal>) -> FxHashSet<RcLocal> {
         // Track (local, rvalue) for definitions
         let mut definitions: FxHashMap<RcLocal, (usize, Option<&RValue>)> = FxHashMap::default();
-        let mut uses: FxHashMap<RcLocal, usize> = FxHashMap::default();
+        // Track uses at the current block level (not inside nested blocks)
+        let mut current_level_uses: FxHashMap<RcLocal, usize> = FxHashMap::default();
         // Track locals used in while/repeat conditions - these should never be inlined
         // because the variable may be modified inside the loop body (which we don't track)
         let mut loop_condition_locals: FxHashSet<RcLocal> = FxHashSet::default();
-        // Track locals used in nested blocks (if/while/for bodies) - we need to count
-        // these uses to avoid incorrectly inlining variables that are used multiple times
-        let mut nested_block_locals: FxHashSet<RcLocal> = FxHashSet::default();
+        // Track locals WRITTEN in nested blocks - these must never be inlined
+        // because the value changes inside the nested block
+        let mut nested_block_writes: FxHashSet<RcLocal> = FxHashSet::default();
+        // Track locals READ in nested blocks - these are uses but can't be inlined via deferred_inlines
+        let mut nested_block_reads: FxHashSet<RcLocal> = FxHashSet::default();
 
         for statement in &block.0 {
             // Count definitions and track what they're assigned to
@@ -346,32 +354,38 @@ impl Inliner {
                     for local in w.condition.values_read() {
                         loop_condition_locals.insert(local.clone());
                     }
-                    // Also track locals used inside the while body
-                    Self::collect_locals_in_block(&w.block.lock(), &mut nested_block_locals);
+                    // Track reads and writes separately
+                    Self::collect_reads_in_block_set(&w.block.lock(), &mut nested_block_reads);
+                    Self::collect_writes_in_block(&w.block.lock(), &mut nested_block_writes);
                 }
                 Statement::Repeat(r) => {
                     for local in r.condition.values_read() {
                         loop_condition_locals.insert(local.clone());
                     }
-                    Self::collect_locals_in_block(&r.block.lock(), &mut nested_block_locals);
+                    Self::collect_reads_in_block_set(&r.block.lock(), &mut nested_block_reads);
+                    Self::collect_writes_in_block(&r.block.lock(), &mut nested_block_writes);
                 }
                 Statement::If(i) => {
-                    // Track locals used inside if/else bodies
-                    Self::collect_locals_in_block(&i.then_block.lock(), &mut nested_block_locals);
-                    Self::collect_locals_in_block(&i.else_block.lock(), &mut nested_block_locals);
+                    // Track reads and writes in if/else bodies
+                    Self::collect_reads_in_block_set(&i.then_block.lock(), &mut nested_block_reads);
+                    Self::collect_reads_in_block_set(&i.else_block.lock(), &mut nested_block_reads);
+                    Self::collect_writes_in_block(&i.then_block.lock(), &mut nested_block_writes);
+                    Self::collect_writes_in_block(&i.else_block.lock(), &mut nested_block_writes);
                 }
                 Statement::NumericFor(nf) => {
-                    Self::collect_locals_in_block(&nf.block.lock(), &mut nested_block_locals);
+                    Self::collect_reads_in_block_set(&nf.block.lock(), &mut nested_block_reads);
+                    Self::collect_writes_in_block(&nf.block.lock(), &mut nested_block_writes);
                 }
                 Statement::GenericFor(gf) => {
-                    Self::collect_locals_in_block(&gf.block.lock(), &mut nested_block_locals);
+                    Self::collect_reads_in_block_set(&gf.block.lock(), &mut nested_block_reads);
+                    Self::collect_writes_in_block(&gf.block.lock(), &mut nested_block_writes);
                 }
                 _ => {}
             }
 
-            // Count uses (only in the same block, don't look into nested blocks)
+            // Count uses at the current block level
             for local in statement.values_read() {
-                *uses.entry(local.clone()).or_default() += 1;
+                *current_level_uses.entry(local.clone()).or_default() += 1;
             }
         }
 
@@ -379,12 +393,30 @@ impl Inliner {
         // - Unnamed temporaries: always inline
         // - Named locals: only inline if assigned side-effect-free value (like field access)
         // - Never inline locals used in while/repeat conditions
-        // - Never inline locals that are also used in nested blocks
+        // - Never inline locals that are ONLY used in nested blocks (deferred inlines won't work)
         definitions
             .into_iter()
             .filter(|(local, (def_count, rvalue))| {
-                let use_count = uses.get(local).copied().unwrap_or(0);
-                if *def_count != 1 || use_count != 1 {
+                // Use name-based lookup for current_level_uses to handle SSA versions
+                let current_uses = current_level_uses.get(local).copied()
+                    .or_else(|| {
+                        local.name().and_then(|name| {
+                            current_level_uses.iter()
+                                .find(|(l, _)| l.name().as_ref() == Some(&name))
+                                .map(|(_, &count)| count)
+                        })
+                    })
+                    .unwrap_or(0);
+                // Check if local is read in nested blocks (by identity or by name for SSA versions)
+                let nested_uses = if nested_block_reads.contains(local) ||
+                    nested_block_reads.iter().any(|l| l.name().is_some() && l.name() == local.name()) {
+                    1
+                } else {
+                    0
+                };
+                let total_uses = current_uses + nested_uses;
+
+                if *def_count != 1 || total_uses != 1 {
                     return false;
                 }
 
@@ -398,10 +430,17 @@ impl Inliner {
                     return false;
                 }
 
-                // Never inline locals that are also used in nested blocks (if/while/for bodies)
-                // because the apparent "single use" in the outer block may be accompanied by
-                // additional uses inside the nested blocks
-                if nested_block_locals.contains(local) {
+                // Never inline locals that are WRITTEN in nested blocks (if/while/for bodies)
+                // because the value changes inside the nested block
+                // Check by identity or by name for SSA versions
+                if nested_block_writes.contains(local) ||
+                    nested_block_writes.iter().any(|l| l.name().is_some() && l.name() == local.name()) {
+                    return false;
+                }
+
+                // Never inline locals that are ONLY read in nested blocks
+                // because deferred_inlines gets cleared when we recurse into nested blocks
+                if current_uses == 0 && nested_uses > 0 {
                     return false;
                 }
 
@@ -423,11 +462,69 @@ impl Inliner {
             .collect()
     }
 
-    /// Collect all locals read in a block (including nested blocks) into the given set
+    /// Collect all locals READ in a block (recursively) into a set.
+    fn collect_reads_in_block_set(block: &Block, reads: &mut FxHashSet<RcLocal>) {
+        for statement in &block.0 {
+            for local in statement.values_read() {
+                reads.insert(local.clone());
+            }
+            // Recurse into nested blocks
+            match statement {
+                Statement::If(i) => {
+                    Self::collect_reads_in_block_set(&i.then_block.lock(), reads);
+                    Self::collect_reads_in_block_set(&i.else_block.lock(), reads);
+                }
+                Statement::While(w) => {
+                    Self::collect_reads_in_block_set(&w.block.lock(), reads);
+                }
+                Statement::Repeat(r) => {
+                    Self::collect_reads_in_block_set(&r.block.lock(), reads);
+                }
+                Statement::NumericFor(nf) => {
+                    Self::collect_reads_in_block_set(&nf.block.lock(), reads);
+                }
+                Statement::GenericFor(gf) => {
+                    Self::collect_reads_in_block_set(&gf.block.lock(), reads);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect all locals WRITTEN in a block (recursively).
+    fn collect_writes_in_block(block: &Block, writes: &mut FxHashSet<RcLocal>) {
+        for statement in &block.0 {
+            for local in statement.values_written() {
+                writes.insert(local.clone());
+            }
+            // Recurse into nested blocks
+            match statement {
+                Statement::If(i) => {
+                    Self::collect_writes_in_block(&i.then_block.lock(), writes);
+                    Self::collect_writes_in_block(&i.else_block.lock(), writes);
+                }
+                Statement::While(w) => {
+                    Self::collect_writes_in_block(&w.block.lock(), writes);
+                }
+                Statement::Repeat(r) => {
+                    Self::collect_writes_in_block(&r.block.lock(), writes);
+                }
+                Statement::NumericFor(nf) => {
+                    Self::collect_writes_in_block(&nf.block.lock(), writes);
+                }
+                Statement::GenericFor(gf) => {
+                    Self::collect_writes_in_block(&gf.block.lock(), writes);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Collect all locals that are read OR written in a block (recursively).
     ///
     /// This includes both `values_read()` and `values_written()` to catch cases
     /// where a local is modified inside a nested block (like if-statements).
+    #[allow(dead_code)]
     fn collect_locals_in_block(block: &Block, locals: &mut FxHashSet<RcLocal>) {
         for statement in &block.0 {
             // Collect reads
@@ -599,9 +696,25 @@ impl Inliner {
         let mut to_inline = Vec::new();
 
         for local in reads {
-            if candidates.contains(local) {
-                if let Some(rvalue) = self.deferred_inlines.remove(local) {
-                    to_inline.push((local.clone(), rvalue));
+            // Check if this local is a candidate - use name-based comparison for SSA versions
+            let is_candidate = candidates.contains(local)
+                || candidates.iter().any(|c| c.name().is_some() && c.name() == local.name());
+
+            if is_candidate {
+                // Look up in deferred_inlines using name-based matching for SSA versions
+                let mut found_key = None;
+                for (key, _) in self.deferred_inlines.iter() {
+                    let matches = key == local
+                        || (key.name().is_some() && key.name() == local.name());
+                    if matches {
+                        found_key = Some(key.clone());
+                        break;
+                    }
+                }
+                if let Some(key) = found_key {
+                    if let Some(rvalue) = self.deferred_inlines.remove(&key) {
+                        to_inline.push((local.clone(), rvalue));
+                    }
                 }
             }
         }
@@ -628,7 +741,10 @@ impl Inliner {
             let rvalue = unsafe { &mut *ptr };
 
             if let RValue::Local(l) = rvalue {
-                if l == local {
+                // Use name-based comparison for SSA versions with same name
+                let matches = l == local
+                    || (l.name().is_some() && l.name() == local.name());
+                if matches {
                     *rvalue = replacement.clone();
                     continue;
                 }
@@ -1284,6 +1400,38 @@ fn simplify_and_chains(block: &mut Block) {
             }
         }
 
+        // Check for true initialization with conditional reassignment:
+        // local v = true
+        // if cond then
+        //     v = expr
+        // end
+        // Becomes: v = not cond or expr
+        if matches!(initial_value, RValue::Literal(Literal::Boolean(true))) {
+            if i + 1 < block.len() {
+                if let Some((condition, new_value)) = extract_true_or_chain(&block[i + 1], &local) {
+                    // Transform to: v = not cond or new_value
+                    let negated_cond = negate_condition(&condition);
+                    let combined = RValue::Binary(crate::Binary::new(
+                        negated_cond,
+                        new_value,
+                        BinaryOperation::Or,
+                    ));
+
+                    let Statement::Assign(assign) = &mut block[i] else {
+                        unreachable!()
+                    };
+                    assign.right[0] = combined;
+                    assign.prefix = is_prefix;
+
+                    // Remove the if statement
+                    block.0.remove(i + 1);
+
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
         i += 1;
     }
 }
@@ -1540,6 +1688,58 @@ fn extract_nested_and_chain(
     }
 
     None
+}
+
+/// Extract the pattern for true initialization with conditional reassignment.
+///
+/// Pattern:
+/// ```lua
+/// local v = true
+/// if cond then
+///     v = expr
+/// end
+/// ```
+///
+/// Returns Some((condition, new_value)) if pattern matches.
+fn extract_true_or_chain(
+    statement: &Statement,
+    target_local: &RcLocal,
+) -> Option<(RValue, RValue)> {
+    let if_stat = statement.as_if()?;
+
+    // Must have empty else branch
+    if !if_stat.else_block.lock().is_empty() {
+        return None;
+    }
+
+    // Then branch must have exactly one assignment
+    let then_block = if_stat.then_block.lock();
+    if then_block.len() != 1 {
+        return None;
+    }
+
+    let then_assign = then_block[0].as_assign()?;
+
+    // Must assign to single local
+    if then_assign.left.len() != 1 || then_assign.right.len() != 1 {
+        return None;
+    }
+
+    let assign_local = then_assign.left[0].as_local()?;
+
+    // Must assign to the same local
+    let same_local = assign_local == target_local
+        || (assign_local.name().is_some() && assign_local.name() == target_local.name());
+    if !same_local {
+        return None;
+    }
+
+    // Don't match if the new value is also true (that would be pointless)
+    if matches!(&then_assign.right[0], RValue::Literal(Literal::Boolean(true))) {
+        return None;
+    }
+
+    Some((if_stat.condition.clone(), then_assign.right[0].clone()))
 }
 
 /// Collapse multi-return assignment patterns.
