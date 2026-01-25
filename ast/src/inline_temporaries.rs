@@ -1234,6 +1234,53 @@ fn simplify_and_chains(block: &mut Block) {
 
                 // Remove the if statement
                 block.0.remove(i + 1);
+
+                i += 1;
+                continue;
+            }
+        }
+
+        // Check for nested if-chain pattern with false initialization:
+        // local v = false
+        // if cond1 then
+        //     v = false
+        //     if cond2 then
+        //         v = finalExpr
+        //     end
+        // end
+        // Becomes: v = cond1 and cond2 and finalExpr
+        if matches!(initial_value, RValue::Literal(Literal::Boolean(false))) {
+            if i + 1 < block.len() {
+                if let Some((conditions, final_expr)) = extract_nested_and_chain(&block[i + 1], &local) {
+                    if !conditions.is_empty() {
+                        // Build: cond1 and cond2 and ... and finalExpr
+                        let mut combined = conditions[0].clone();
+                        for cond in &conditions[1..] {
+                            combined = RValue::Binary(crate::Binary::new(
+                                combined,
+                                cond.clone(),
+                                BinaryOperation::And,
+                            ));
+                        }
+                        combined = RValue::Binary(crate::Binary::new(
+                            combined,
+                            final_expr,
+                            BinaryOperation::And,
+                        ));
+
+                        let Statement::Assign(assign) = &mut block[i] else {
+                            unreachable!()
+                        };
+                        assign.right[0] = combined;
+                        assign.prefix = is_prefix;
+
+                        // Remove the if statement
+                        block.0.remove(i + 1);
+
+                        i += 1;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -1402,6 +1449,97 @@ fn extract_and_chain_value(statement: &Statement) -> RValue {
     let then_block = if_stat.then_block.lock();
     let then_assign = then_block[0].as_assign().unwrap();
     then_assign.right[0].clone()
+}
+
+/// Extract conditions from a nested if-chain pattern.
+///
+/// Pattern:
+/// ```lua
+/// if cond1 then
+///     v = false  -- optional
+///     if cond2 then
+///         v = false  -- optional
+///         if cond3 then
+///             v = finalExpr
+///         end
+///     end
+/// end
+/// ```
+///
+/// Returns (conditions, final_expr) where conditions is [cond1, cond2, cond3, ...]
+/// and final_expr is the value assigned in the innermost if.
+fn extract_nested_and_chain(
+    statement: &Statement,
+    target_local: &RcLocal,
+) -> Option<(Vec<RValue>, RValue)> {
+    let if_stat = statement.as_if()?;
+
+    // Must have empty else branch
+    if !if_stat.else_block.lock().is_empty() {
+        return None;
+    }
+
+    let mut conditions = vec![if_stat.condition.clone()];
+    let then_block = if_stat.then_block.lock();
+
+    // The then-block can have:
+    // 1. Just another if statement (nested chain)
+    // 2. An assignment to false followed by another if statement
+    // 3. Just an assignment (the final value)
+
+    let mut statements = then_block.0.iter().peekable();
+
+    // Skip any assignments to false
+    while let Some(stmt) = statements.peek() {
+        if let Some(assign) = stmt.as_assign() {
+            if assign.left.len() == 1 && assign.right.len() == 1 {
+                if let Some(local) = assign.left[0].as_local() {
+                    let same_local = local == target_local
+                        || (local.name().is_some() && local.name() == target_local.name());
+                    if same_local {
+                        if matches!(&assign.right[0], RValue::Literal(Literal::Boolean(false))) {
+                            statements.next();
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    // Now we should have either an if statement or a final assignment
+    let remaining: Vec<_> = statements.collect();
+
+    if remaining.len() == 1 {
+        // Could be a nested if or a final assignment
+        if let Some(nested_if) = remaining[0].as_if() {
+            // Recursively extract from nested if
+            let nested_stmt = Statement::If(nested_if.clone());
+            if let Some((nested_conditions, final_expr)) =
+                extract_nested_and_chain(&nested_stmt, target_local)
+            {
+                conditions.extend(nested_conditions);
+                return Some((conditions, final_expr));
+            }
+        } else if let Some(assign) = remaining[0].as_assign() {
+            // This is the final assignment
+            if assign.left.len() == 1 && assign.right.len() == 1 {
+                if let Some(local) = assign.left[0].as_local() {
+                    let same_local = local == target_local
+                        || (local.name().is_some() && local.name() == target_local.name());
+                    if same_local {
+                        // Don't match if final value is also false (that would be pointless)
+                        if !matches!(&assign.right[0], RValue::Literal(Literal::Boolean(false))) {
+                            return Some((conditions, assign.right[0].clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Collapse multi-return assignment patterns.
