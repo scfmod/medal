@@ -853,11 +853,21 @@ impl Inliner {
         local: &RcLocal,
         replacement: RValue,
     ) {
+        // Collect RValues from both the right side AND from LValues on the left side.
+        // For example, in `v2_[1] = x`, the `v2_` is inside an LValue::Index and needs
+        // to be traversed for replacement.
         let mut work: Vec<*mut RValue> = statement
             .rvalues_mut()
             .into_iter()
             .map(|r| r as *mut RValue)
             .collect();
+
+        // Also collect RValues from LValues (e.g., the table in `table[idx] = val`)
+        for lvalue in statement.lvalues_mut() {
+            if let LValue::Index(index) = lvalue {
+                work.extend(index.rvalues_mut().into_iter().map(|r| r as *mut RValue));
+            }
+        }
 
         while let Some(ptr) = work.pop() {
             let rvalue = unsafe { &mut *ptr };
