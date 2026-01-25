@@ -424,9 +424,18 @@ impl Inliner {
     }
 
     /// Collect all locals read in a block (including nested blocks) into the given set
+    /// Collect all locals that are read OR written in a block (recursively).
+    ///
+    /// This includes both `values_read()` and `values_written()` to catch cases
+    /// where a local is modified inside a nested block (like if-statements).
     fn collect_locals_in_block(block: &Block, locals: &mut FxHashSet<RcLocal>) {
         for statement in &block.0 {
+            // Collect reads
             for local in statement.values_read() {
+                locals.insert(local.clone());
+            }
+            // Collect writes - important for catching reassignments in nested blocks
+            for local in statement.values_written() {
                 locals.insert(local.clone());
             }
             // Recurse into nested blocks
@@ -1165,40 +1174,67 @@ fn simplify_and_chains(block: &mut Block) {
             }
         }
 
-        if chain_count == 0 {
+        if chain_count > 0 {
+            // Now fold all the if statements into the assignment
+            // Get the initial RValue
+            let Statement::Assign(assign) = &mut block[i] else {
+                unreachable!()
+            };
+            let mut combined = assign.right[0].clone();
+
+            // Fold each if statement
+            for k in (i + 1)..=(i + chain_count) {
+                let new_value = extract_and_chain_value(&block[k]);
+
+                // Create: combined and new_value
+                combined = RValue::Binary(crate::Binary::new(
+                    combined,
+                    new_value,
+                    BinaryOperation::And,
+                ));
+            }
+
+            // Update the original assignment
+            let Statement::Assign(assign) = &mut block[i] else {
+                unreachable!()
+            };
+            assign.right[0] = combined;
+            assign.prefix = is_prefix;
+
+            // Remove the if statements
+            for _ in 0..chain_count {
+                block.0.remove(i + 1);
+            }
+
             i += 1;
             continue;
         }
 
-        // Now fold all the if statements into the assignment
-        // Get the initial RValue
-        let Statement::Assign(assign) = &mut block[i] else {
+        // Check for or-chain pattern: local v = cond1; if not cond1 then v = cond2 end
+        // This becomes: v = cond1 or cond2
+        let Statement::Assign(assign) = &block[i] else {
             unreachable!()
         };
-        let mut combined = assign.right[0].clone();
+        let initial_value = assign.right[0].clone();
 
-        // Fold each if statement
-        for k in (i + 1)..=(i + chain_count) {
-            let new_value = extract_and_chain_value(&block[k]);
+        if i + 1 < block.len() {
+            if let Some(or_value) = is_or_chain_pattern(&block[i + 1], &local, &initial_value) {
+                // Transform to: v = initial_value or or_value
+                let combined = RValue::Binary(crate::Binary::new(
+                    initial_value,
+                    or_value,
+                    BinaryOperation::Or,
+                ));
 
-            // Create: combined and new_value
-            combined = RValue::Binary(crate::Binary::new(
-                combined,
-                new_value,
-                BinaryOperation::And,
-            ));
-        }
+                let Statement::Assign(assign) = &mut block[i] else {
+                    unreachable!()
+                };
+                assign.right[0] = combined;
+                assign.prefix = is_prefix;
 
-        // Update the original assignment
-        let Statement::Assign(assign) = &mut block[i] else {
-            unreachable!()
-        };
-        assign.right[0] = combined;
-        assign.prefix = is_prefix;
-
-        // Remove the if statements
-        for _ in 0..chain_count {
-            block.0.remove(i + 1);
+                // Remove the if statement
+                block.0.remove(i + 1);
+            }
         }
 
         i += 1;
@@ -1260,6 +1296,104 @@ fn is_and_chain_pattern(statement: &Statement, target_local: &RcLocal) -> bool {
     // Must assign to the same local
     assign_local == target_local
         || (assign_local.name().is_some() && assign_local.name() == target_local.name())
+}
+
+/// Check if statement matches the or-chain pattern: if not cond1 then v = cond2 end
+/// where cond1 is the initial value assigned to v.
+///
+/// Pattern: local v = cond1; if not cond1 then v = cond2 end
+/// Becomes: local v = cond1 or cond2
+///
+/// The condition can be:
+/// 1. Negated initial value: `if not (x == y) then` or `if x ~= y then`
+/// 2. The initial value must be a comparison that can be negated
+///
+/// Returns Some(or_value) if pattern matches, where or_value is the value to OR with.
+fn is_or_chain_pattern(
+    statement: &Statement,
+    target_local: &RcLocal,
+    initial_value: &RValue,
+) -> Option<RValue> {
+    let if_stat = statement.as_if()?;
+
+    // Must have empty else branch
+    if !if_stat.else_block.lock().is_empty() {
+        return None;
+    }
+
+    // Then branch must have exactly one assignment
+    let then_block = if_stat.then_block.lock();
+    if then_block.len() != 1 {
+        return None;
+    }
+
+    let then_assign = then_block[0].as_assign()?;
+
+    // Must assign to single local
+    if then_assign.left.len() != 1 || then_assign.right.len() != 1 {
+        return None;
+    }
+
+    let assign_local = then_assign.left[0].as_local()?;
+
+    // Must assign to the same local
+    let same_local = assign_local == target_local
+        || (assign_local.name().is_some() && assign_local.name() == target_local.name());
+    if !same_local {
+        return None;
+    }
+
+    // Check if condition is the negation of initial_value
+    // Case 1: initial_value is `x == y` and condition is `x ~= y`
+    // Case 2: initial_value is `x ~= y` and condition is `x == y`
+    // Case 3: condition is `not initial_value`
+    if is_negation_of(&if_stat.condition, initial_value) {
+        return Some(then_assign.right[0].clone());
+    }
+
+    None
+}
+
+/// Check if `condition` is the negation of `original`.
+///
+/// Returns true if:
+/// - `condition` is `not original`
+/// - `original` is `a == b` and `condition` is `a ~= b`
+/// - `original` is `a ~= b` and `condition` is `a == b`
+/// - Similar for <, <=, >, >=
+fn is_negation_of(condition: &RValue, original: &RValue) -> bool {
+    // Case 1: condition is `not original`
+    if let RValue::Unary(unary) = condition {
+        if unary.operation == UnaryOperation::Not {
+            return rvalues_equal(&unary.value, original);
+        }
+    }
+
+    // Case 2: Both are binary comparisons with opposite operators
+    if let (RValue::Binary(cond_bin), RValue::Binary(orig_bin)) = (condition, original) {
+        // Check if operands are the same
+        let same_operands = rvalues_equal(&cond_bin.left, &orig_bin.left)
+            && rvalues_equal(&cond_bin.right, &orig_bin.right);
+
+        if same_operands {
+            // Check if operations are negations of each other
+            let is_negated = matches!(
+                (cond_bin.operation, orig_bin.operation),
+                (BinaryOperation::Equal, BinaryOperation::NotEqual)
+                    | (BinaryOperation::NotEqual, BinaryOperation::Equal)
+                    | (BinaryOperation::LessThan, BinaryOperation::GreaterThanOrEqual)
+                    | (BinaryOperation::GreaterThanOrEqual, BinaryOperation::LessThan)
+                    | (BinaryOperation::LessThanOrEqual, BinaryOperation::GreaterThan)
+                    | (BinaryOperation::GreaterThan, BinaryOperation::LessThanOrEqual)
+            );
+
+            if is_negated {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Extract the new value from an and-chain if statement
