@@ -110,6 +110,12 @@ impl Inliner {
             // Note: we DON'T clear immediate_inlines or deferred_inlines here anymore -
             // they persist until applied to a later statement in this block.
 
+            // Before recursing, apply any pending deferred inlines to the nested block(s).
+            // This allows side-effect-free values from the parent scope to be inlined into
+            // nested if/while/for blocks. Note: this modifies deferred_inlines (removing
+            // consumed entries), which is intentional.
+            self.apply_pending_deferred_to_nested(&mut block[i]);
+
             // Recurse into nested blocks and closures, passing down protected locals
             // Save and restore both maps so nested processing doesn't affect outer scope
             let saved_immediate = std::mem::take(&mut self.immediate_inlines);
@@ -557,10 +563,18 @@ impl Inliner {
                     return false;
                 }
 
-                // Never inline locals that are ONLY read in nested blocks
-                // because deferred_inlines gets cleared when we recurse into nested blocks
+                // For locals only read in nested blocks:
+                // - Side-effect-free values CAN be inlined (we pass deferred_inlines to nested blocks)
+                // - Side-effect values CANNOT be inlined (would change execution order)
                 if current_uses == 0 && nested_uses > 0 {
-                    return false;
+                    if let Some(rv) = rvalue {
+                        if has_side_effects(rv) {
+                            return false;
+                        }
+                        // Side-effect-free, allow it to be a candidate
+                    } else {
+                        return false;
+                    }
                 }
 
                 // Unnamed temporaries: no name, or name matches v\d+_ pattern
@@ -896,6 +910,116 @@ impl Inliner {
                     .into_iter()
                     .map(|r| r as *mut RValue),
             );
+        }
+    }
+
+    /// Apply pending deferred inlines to nested blocks within a statement.
+    /// This is called before recursing into a statement to apply side-effect-free
+    /// values from the parent scope into nested if/while/for blocks.
+    fn apply_pending_deferred_to_nested(&mut self, statement: &mut Statement) {
+        if self.deferred_inlines.is_empty() {
+            return;
+        }
+
+        match statement {
+            Statement::If(r#if) => {
+                self.apply_deferred_inlines_to_nested_block(&mut r#if.then_block.lock());
+                self.apply_deferred_inlines_to_nested_block(&mut r#if.else_block.lock());
+            }
+            Statement::While(r#while) => {
+                self.apply_deferred_inlines_to_nested_block(&mut r#while.block.lock());
+            }
+            Statement::Repeat(repeat) => {
+                self.apply_deferred_inlines_to_nested_block(&mut repeat.block.lock());
+            }
+            Statement::NumericFor(nf) => {
+                self.apply_deferred_inlines_to_nested_block(&mut nf.block.lock());
+            }
+            Statement::GenericFor(gf) => {
+                self.apply_deferred_inlines_to_nested_block(&mut gf.block.lock());
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply pending deferred inlines to all statements in a nested block.
+    /// This is called before recursively processing a nested block so that
+    /// side-effect-free values from the parent scope can be inlined into the
+    /// nested block.
+    fn apply_deferred_inlines_to_nested_block(&mut self, block: &mut Block) {
+        if self.deferred_inlines.is_empty() {
+            return;
+        }
+
+        // Iterate through all statements in the block and apply pending inlines
+        for statement in block.0.iter_mut() {
+            self.apply_pending_deferred_inlines_recursive(statement);
+        }
+    }
+
+    /// Recursively apply pending deferred inlines to a statement and its nested blocks.
+    fn apply_pending_deferred_inlines_recursive(&mut self, statement: &mut Statement) {
+        if self.deferred_inlines.is_empty() {
+            return;
+        }
+
+        // Find locals from deferred_inlines that are used in this statement
+        let reads = statement.values_read();
+        let mut to_inline = Vec::new();
+
+        for local in reads {
+            // Look up in deferred_inlines using name-based matching for SSA versions
+            let mut found_key = None;
+            for (key, _) in self.deferred_inlines.iter() {
+                let matches = key == local
+                    || (key.name().is_some() && key.name() == local.name());
+                if matches {
+                    found_key = Some(key.clone());
+                    break;
+                }
+            }
+            if let Some(key) = found_key {
+                if let Some(rvalue) = self.deferred_inlines.remove(&key) {
+                    to_inline.push((local.clone(), rvalue));
+                }
+            }
+        }
+
+        for (local, rvalue) in to_inline {
+            self.replace_local_with_rvalue(statement, &local, rvalue);
+        }
+
+        // Recurse into nested blocks within this statement
+        match statement {
+            Statement::If(r#if) => {
+                for stmt in r#if.then_block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+                for stmt in r#if.else_block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::While(r#while) => {
+                for stmt in r#while.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::Repeat(repeat) => {
+                for stmt in repeat.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::NumericFor(nf) => {
+                for stmt in nf.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            Statement::GenericFor(gf) => {
+                for stmt in gf.block.lock().0.iter_mut() {
+                    self.apply_pending_deferred_inlines_recursive(stmt);
+                }
+            }
+            _ => {}
         }
     }
 
