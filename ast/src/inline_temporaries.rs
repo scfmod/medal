@@ -121,6 +121,12 @@ impl Inliner {
 
         self.immediate_inlines.clear();
         self.deferred_inlines.clear();
+
+        // Fix broken swap patterns like:
+        // local temp = a; a = b; temp = b; b = a
+        // Into: a, b = b, a
+        // This runs LAST to avoid interference from inlining passes
+        fix_broken_swap_patterns(block);
     }
 
     /// Inline expressions into for-loop headers.
@@ -846,10 +852,11 @@ impl Inliner {
             let rvalue = unsafe { &mut *ptr };
 
             if let RValue::Local(l) = rvalue {
-                // Use name-based comparison for SSA versions with same name
-                let matches = l == local
-                    || (l.name().is_some() && l.name() == local.name());
-                if matches {
+                // Use identity-based comparison only - name-based matching is too aggressive
+                // and can incorrectly replace unrelated locals that happen to have the same name.
+                // SSA versions should already be unified by SSA destruction, so identity comparison
+                // should be sufficient.
+                if l == local {
                     *rvalue = replacement.clone();
                     continue;
                 }
@@ -2459,4 +2466,164 @@ impl DeadStoreRemover {
             self.process_closures_in_rvalue(rv);
         }
     }
+}
+
+/// Fix broken swap patterns that the decompiler generates incorrectly.
+///
+/// Pattern (broken):
+/// ```lua
+/// local temp = a     -- (0) temp gets a's value
+/// a = b              -- (1) a gets b's value
+/// temp = b           -- (2) temp gets b's value (BUG - overwrites saved a!)
+/// b = a              -- (3) b gets a (which is b now)
+/// ```
+///
+/// This is transformed into:
+/// ```lua
+/// a, b = b, a
+/// ```
+fn fix_broken_swap_patterns(block: &mut Block) {
+    let mut i = 0;
+    while i + 3 < block.len() {
+        // Check for the 4-statement broken swap pattern
+        if let Some((var_a, var_b)) = detect_broken_swap(&block[i..i + 4]) {
+            // Remove statements 1, 2, 3 (keeping index i for the swap)
+            block.0.remove(i + 3);
+            block.0.remove(i + 2);
+            block.0.remove(i + 1);
+
+            // Replace statement 0 with the multi-assignment swap
+            // For: temp = a; a = b; temp = b; b = a
+            // We want: a, b = b, a
+            let swap_assign = Assign::new(
+                vec![var_a.clone().into(), var_b.clone().into()],
+                vec![RValue::Local(var_b.clone()), RValue::Local(var_a.clone())],
+            );
+            block[i] = swap_assign.into();
+
+            // Don't increment - check from same position in case there are more
+            continue;
+        }
+
+        i += 1;
+    }
+
+    // Recurse into nested blocks
+    for stmt in block.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                fix_broken_swap_patterns(&mut if_stat.then_block.lock());
+                fix_broken_swap_patterns(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                fix_broken_swap_patterns(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                fix_broken_swap_patterns(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                fix_broken_swap_patterns(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                fix_broken_swap_patterns(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Process closures
+        for rvalue in stmt.rvalues_mut() {
+            fix_broken_swap_in_closures(rvalue);
+        }
+    }
+}
+
+fn fix_broken_swap_in_closures(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        fix_broken_swap_patterns(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        fix_broken_swap_in_closures(rv);
+    }
+}
+
+/// Detect the broken swap pattern in 4 consecutive statements.
+///
+/// Pattern:
+/// ```lua
+/// local temp = a     -- stmt[0]: temp = a
+/// a = b              -- stmt[1]: a = b
+/// temp = b           -- stmt[2]: temp = b (the bug - should not exist)
+/// b = a              -- stmt[3]: b = a
+/// ```
+///
+/// Returns Some((a, b)) if the pattern matches, where a and b are the variables being swapped.
+fn detect_broken_swap(stmts: &[Statement]) -> Option<(RcLocal, RcLocal)> {
+    if stmts.len() < 4 {
+        return None;
+    }
+
+    // stmt[0]: local temp = a
+    let stmt0 = stmts[0].as_assign()?;
+    if stmt0.left.len() != 1 || stmt0.right.len() != 1 {
+        return None;
+    }
+    let temp = stmt0.left[0].as_local()?;
+    // Only match unnamed temporaries
+    if !temp.name().map_or(true, |n| is_unnamed_temporary(&n)) {
+        return None;
+    }
+    let var_a = stmt0.right[0].as_local()?;
+
+    // stmt[1]: a = b
+    let stmt1 = stmts[1].as_assign()?;
+    if stmt1.left.len() != 1 || stmt1.right.len() != 1 {
+        return None;
+    }
+    let stmt1_left = stmt1.left[0].as_local()?;
+    let var_b = stmt1.right[0].as_local()?;
+    // stmt1_left should be var_a
+    if !locals_equal(stmt1_left, var_a) {
+        return None;
+    }
+
+    // stmt[2]: temp = b (the broken reassignment)
+    let stmt2 = stmts[2].as_assign()?;
+    if stmt2.left.len() != 1 || stmt2.right.len() != 1 {
+        return None;
+    }
+    let stmt2_left = stmt2.left[0].as_local()?;
+    let stmt2_right = stmt2.right[0].as_local()?;
+    // stmt2_left should be temp, stmt2_right should be var_b (or var_a after stmt1)
+    if !locals_equal(stmt2_left, temp) {
+        return None;
+    }
+    // stmt2_right could be var_b (before swap) or the new value of var_a (which is var_b)
+    // In the broken pattern, it's typically var_b or the same as stmt1's right
+    if !locals_equal(stmt2_right, var_b) && !locals_equal(stmt2_right, var_a) {
+        return None;
+    }
+
+    // stmt[3]: b = a (but a is now b, so this makes b = b effectively)
+    let stmt3 = stmts[3].as_assign()?;
+    if stmt3.left.len() != 1 || stmt3.right.len() != 1 {
+        return None;
+    }
+    let stmt3_left = stmt3.left[0].as_local()?;
+    let stmt3_right = stmt3.right[0].as_local()?;
+    // stmt3_left should be var_b, stmt3_right should be var_a (or temp in a correct swap)
+    if !locals_equal(stmt3_left, var_b) {
+        return None;
+    }
+    // stmt3_right should be var_a (the now-corrupted value) or temp
+    if !locals_equal(stmt3_right, var_a) && !locals_equal(stmt3_right, temp) {
+        return None;
+    }
+
+    Some((var_a.clone(), var_b.clone()))
+}
+
+/// Check if two locals are equal (by identity or by name for SSA versions)
+fn locals_equal(a: &RcLocal, b: &RcLocal) -> bool {
+    a == b || (a.name().is_some() && a.name() == b.name())
 }
