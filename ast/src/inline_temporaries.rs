@@ -2234,12 +2234,22 @@ fn collapse_multi_return_assignments(block: &mut Block) {
 
         // Now look ahead for consecutive single assignments that use each local exactly once
         // in order: target1 = v1, target2 = v2, ...
+        // Skip locals named "_" as they're intentionally discarded and have no assignment.
         let num_locals = locals.len();
         let mut targets: Vec<LValue> = Vec::with_capacity(num_locals);
         let mut matched_count = 0;
+        let mut stmt_offset = 0;  // Track actual statement offset (skipping _ locals)
 
-        for (idx, local) in locals.iter().enumerate() {
-            let next_idx = i + 1 + idx;
+        for local in locals.iter() {
+            // Skip discarded locals (named "_") - they have no assignment to match
+            if local.name().as_deref() == Some("_") {
+                // Add a placeholder LValue for the discarded position
+                targets.push(LValue::Local(local.clone()));
+                matched_count += 1;
+                continue;
+            }
+
+            let next_idx = i + 1 + stmt_offset;
             if next_idx >= block.len() {
                 break;
             }
@@ -2266,6 +2276,7 @@ fn collapse_multi_return_assignments(block: &mut Block) {
 
             targets.push(next_assign.left[0].clone());
             matched_count += 1;
+            stmt_offset += 1;  // Only increment for non-_ locals
         }
 
         // Only collapse if we matched ALL the locals
@@ -2273,6 +2284,9 @@ fn collapse_multi_return_assignments(block: &mut Block) {
             i += 1;
             continue;
         }
+
+        // Count how many statements to remove (only non-_ locals have assignments)
+        let stmts_to_remove = stmt_offset;
 
         // Extract the call RValue
         let Statement::Assign(assign) = &mut block[i] else {
@@ -2286,8 +2300,8 @@ fn collapse_multi_return_assignments(block: &mut Block) {
         // Replace the original multi-local assignment with the collapsed one
         block.0[i] = collapsed.into();
 
-        // Remove the individual assignments
-        for _ in 0..matched_count {
+        // Remove the individual assignments (only non-_ locals have statements)
+        for _ in 0..stmts_to_remove {
             block.0.remove(i + 1);
         }
 
