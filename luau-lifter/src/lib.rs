@@ -97,6 +97,18 @@ pub fn dump_bytecode(bytecode: &[u8], encode_key: u8, func_name: Option<&str>) {
                 for (i, constant) in func.constants.iter().enumerate() {
                     println!("  K{}: {:?}", i, constant);
                 }
+
+                if !func.local_debug_info.is_empty() {
+                    println!("\nLocal Debug Info:");
+                    for info in &func.local_debug_info {
+                        let name = if info.name_index > 0 && info.name_index <= chunk.string_table.len() {
+                            String::from_utf8_lossy(&chunk.string_table[info.name_index - 1]).to_string()
+                        } else {
+                            "(no name)".to_string()
+                        };
+                        println!("  R{}: \"{}\" (PC {}-{})", info.register, name, info.scope_start, info.scope_end);
+                    }
+                }
             }
         }
     }

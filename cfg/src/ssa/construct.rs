@@ -422,7 +422,19 @@ impl<'a> SsaConstructor<'a> {
                     if !self.new_upvalues_in.contains_key(to_old)
                         && !self.upvalues_passed.contains_key(to_old)
                     {
-                        self.local_map.insert(from.clone(), to.clone());
+                        // Prefer keeping the variable with a debug name.
+                        // If `from` has a name and `to` doesn't, map `to → from`
+                        // so the named variable is preserved in the output.
+                        let from_has_name = from.name().is_some();
+                        let to_has_name = to.name().is_some();
+                        if from_has_name && !to_has_name {
+                            // from has name, to doesn't -> keep from, map to → from
+                            self.local_map.insert(to.clone(), from.clone());
+                        } else {
+                            // Either: to has name, or neither has name, or both have names
+                            // -> keep to (original behavior)
+                            self.local_map.insert(from.clone(), to.clone());
+                        }
                         block[index] = ast::Empty {}.into();
                     }
                 }
