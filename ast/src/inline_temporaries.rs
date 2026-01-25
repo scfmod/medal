@@ -146,6 +146,11 @@ impl Inliner {
         // Into: return {a, b, c}
         simplify_set_list_patterns(block);
 
+        // Collapse table field assignments into inline table literals:
+        // local v2_ = {}; v2_.FIELD1 = expr1; v2_.FIELD2 = expr2; target = v2_
+        // Into: target = {FIELD1 = expr1, FIELD2 = expr2}
+        collapse_table_field_assignments(block);
+
         // Coalesce reassignment patterns like:
         // local year = match(...); local v12_ = tonumber(year)
         // Into: local year = match(...); year = tonumber(year)
@@ -3825,5 +3830,201 @@ fn collect_locals_read_in_rvalue(rvalue: &RValue, locals_read: &mut FxHashSet<Rc
 
     for rv in rvalue.rvalues() {
         collect_locals_read_in_rvalue(rv, locals_read);
+    }
+}
+
+/// Collapse table field assignments into inline table literals.
+///
+/// Transforms patterns like:
+/// ```lua
+/// local v2_ = {}
+/// v2_.PAST_PERIOD_COUNT = GS_IS_MOBILE_VERSION and 3 or 4
+/// v2_.LOAN_STEP = 5000
+/// InGameMenuStatisticsFrame.FINANCES = v2_
+/// ```
+/// Into:
+/// ```lua
+/// InGameMenuStatisticsFrame.FINANCES = {
+///     PAST_PERIOD_COUNT = GS_IS_MOBILE_VERSION and 3 or 4,
+///     LOAN_STEP = 5000
+/// }
+/// ```
+fn collapse_table_field_assignments(block: &mut Block) {
+    // First recurse into nested blocks
+    for stmt in block.0.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                collapse_table_field_assignments(&mut if_stat.then_block.lock());
+                collapse_table_field_assignments(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                collapse_table_field_assignments(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                collapse_table_field_assignments(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                collapse_table_field_assignments(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                collapse_table_field_assignments(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+
+        // Recurse into closures
+        for rvalue in stmt.rvalues_mut() {
+            collapse_table_field_in_closures(rvalue);
+        }
+    }
+
+    let mut i = 0;
+    while i < block.len() {
+        // Look for: local v = {}
+        let Some(assign1) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be single local = empty table
+        if assign1.left.len() != 1 || assign1.right.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        let Some(local) = assign1.left[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        // Right side must be a table literal (can be empty or have existing entries)
+        let Some(initial_table) = assign1.right[0].as_table() else {
+            i += 1;
+            continue;
+        };
+
+        // Check if it's an unnamed temp
+        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+        if !is_unnamed {
+            i += 1;
+            continue;
+        }
+
+        // Collect consecutive field assignments: v.FIELD = expr
+        // We need at least one field assignment for this optimization to make sense
+        let mut field_assignments: Vec<(RValue, RValue)> = Vec::new();
+        let mut j = i + 1;
+
+        while j < block.len() {
+            let Some(field_assign) = block[j].as_assign() else {
+                break;
+            };
+
+            // Must be single assignment
+            if field_assign.left.len() != 1 || field_assign.right.len() != 1 {
+                break;
+            }
+
+            // LHS must be v.FIELD (Index with our local on the left)
+            let Some(index) = field_assign.left[0].as_index() else {
+                break;
+            };
+
+            // The index left side must be our local
+            let Some(index_local) = index.left.as_local() else {
+                break;
+            };
+
+            let same_local = index_local == local
+                || (index_local.name().is_some() && index_local.name() == local.name());
+
+            if !same_local {
+                break;
+            }
+
+            // The index right side should be a string literal (for named fields)
+            // or could be any expression (for computed keys)
+            let key = (*index.right).clone();
+            let value = field_assign.right[0].clone();
+
+            field_assignments.push((key, value));
+            j += 1;
+        }
+
+        // Need at least one field assignment
+        if field_assignments.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Now look for the final assignment: target = v
+        if j >= block.len() {
+            i += 1;
+            continue;
+        }
+
+        let Some(final_assign) = block[j].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Final assignment must be: target = v (single assignment with our local on RHS)
+        if final_assign.left.len() != 1 || final_assign.right.len() != 1 {
+            i += 1;
+            continue;
+        }
+
+        let Some(rhs_local) = final_assign.right[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        let same = rhs_local == local
+            || (rhs_local.name().is_some() && rhs_local.name() == local.name());
+
+        if !same {
+            i += 1;
+            continue;
+        }
+
+        // Build the new table: start with initial entries, then add field assignments
+        let mut table_entries: Vec<(Option<RValue>, RValue)> = initial_table.0.clone();
+        for (key, value) in field_assignments {
+            table_entries.push((Some(key), value));
+        }
+
+        let new_table = RValue::Table(crate::Table(table_entries));
+        let target = final_assign.left[0].clone();
+
+        // Remove all statements from i to j (inclusive)
+        // That's: local v = {}, all field assignments, and target = v
+        let stmts_to_remove = j - i + 1;
+        for _ in 0..stmts_to_remove {
+            block.0.remove(i);
+        }
+
+        // Insert the collapsed assignment: target = {fields...}
+        block.0.insert(
+            i,
+            Statement::Assign(crate::Assign {
+                left: vec![target],
+                right: vec![new_table],
+                prefix: false,
+                parallel: false,
+            }),
+        );
+
+        // Don't increment i - check the new statement at this position
+        // (it might be part of another pattern)
+    }
+}
+
+fn collapse_table_field_in_closures(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        collapse_table_field_assignments(&mut closure.function.lock().body);
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        collapse_table_field_in_closures(rv);
     }
 }
