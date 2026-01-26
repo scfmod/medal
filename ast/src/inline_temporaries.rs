@@ -3849,6 +3849,79 @@ fn simplify_set_list_patterns(block: &mut Block) {
             }
         }
 
+        // Pattern 4: local x = func(..., v, ...) where v is a SetList'd table
+        // e.g., local j = j(node, get, set, v81_, time)
+        // Find the local and indices first, then do modifications
+        let mut pattern4_match: Option<(usize, usize)> = None; // (rhs_idx, arg_idx)
+
+        if let Some(assign4) = block[use_idx].as_assign() {
+            'outer: for (rhs_idx, rhs) in assign4.right.iter().enumerate() {
+                let call_args: Option<&Vec<RValue>> = match rhs {
+                    RValue::Call(call) => Some(&call.arguments),
+                    RValue::MethodCall(mcall) => Some(&mcall.arguments),
+                    // Also handle Select which wraps calls (for multi-return scenarios)
+                    RValue::Select(select) => match select {
+                        Select::Call(call) => Some(&call.arguments),
+                        Select::MethodCall(mcall) => Some(&mcall.arguments),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                if let Some(args) = call_args {
+                    let mut found_count = 0;
+                    let mut found_arg_idx = None;
+
+                    for (idx, arg) in args.iter().enumerate() {
+                        if let Some(arg_local) = arg.as_local() {
+                            let same = arg_local == local
+                                || (arg_local.name().is_some() && arg_local.name() == local.name());
+                            if same {
+                                found_arg_idx = Some(idx);
+                                found_count += 1;
+                            }
+                        }
+                    }
+
+                    if found_count == 1 {
+                        if let Some(arg_idx) = found_arg_idx {
+                            pattern4_match = Some((rhs_idx, arg_idx));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((rhs_idx, arg_idx)) = pattern4_match {
+            // Transform: remove table init and SetList, replace local in call with table
+            block.0.remove(set_list_idx); // Remove SetList
+            block.0.remove(i); // Remove local v = {}
+            let new_use_idx = use_idx - 2;
+            // Modify the call argument
+            if let Statement::Assign(assign) = &mut block.0[new_use_idx] {
+                match &mut assign.right[rhs_idx] {
+                    RValue::Call(call) => {
+                        call.arguments[arg_idx] = values_rvalue;
+                    }
+                    RValue::MethodCall(mcall) => {
+                        mcall.arguments[arg_idx] = values_rvalue;
+                    }
+                    RValue::Select(select) => match select {
+                        Select::Call(call) => {
+                            call.arguments[arg_idx] = values_rvalue;
+                        }
+                        Select::MethodCall(mcall) => {
+                            mcall.arguments[arg_idx] = values_rvalue;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
         i += 1;
     }
 }
