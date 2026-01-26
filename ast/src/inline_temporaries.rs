@@ -510,6 +510,9 @@ impl Inliner {
         let mut nested_block_writes: FxHashSet<RcLocal> = FxHashSet::default();
         // Track locals READ in nested blocks - these are uses but can't be inlined via deferred_inlines
         let mut nested_block_reads: FxHashSet<RcLocal> = FxHashSet::default();
+        // Track locals captured as upvalues by closures - these must NEVER be inlined
+        // because closures capture the local reference, not just its value
+        let mut upvalue_captured: FxHashSet<RcLocal> = FxHashSet::default();
 
         for statement in &block.0 {
             // Count definitions and track what they're assigned to
@@ -529,9 +532,10 @@ impl Inliner {
                     for local in w.condition.values_read() {
                         loop_condition_locals.insert(local.clone());
                     }
-                    // Track reads and writes separately
+                    // Track reads, writes, and upvalue captures separately
                     Self::collect_reads_in_block_set(&w.block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&w.block.lock(), &mut nested_block_writes);
+                    Self::collect_upvalue_captures_in_block(&w.block.lock(), &mut upvalue_captured);
                 }
                 Statement::Repeat(r) => {
                     for local in r.condition.values_read() {
@@ -539,23 +543,33 @@ impl Inliner {
                     }
                     Self::collect_reads_in_block_set(&r.block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&r.block.lock(), &mut nested_block_writes);
+                    Self::collect_upvalue_captures_in_block(&r.block.lock(), &mut upvalue_captured);
                 }
                 Statement::If(i) => {
-                    // Track reads and writes in if/else bodies
+                    // Track reads, writes, and upvalue captures in if/else bodies
                     Self::collect_reads_in_block_set(&i.then_block.lock(), &mut nested_block_reads);
                     Self::collect_reads_in_block_set(&i.else_block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&i.then_block.lock(), &mut nested_block_writes);
                     Self::collect_writes_in_block(&i.else_block.lock(), &mut nested_block_writes);
+                    Self::collect_upvalue_captures_in_block(&i.then_block.lock(), &mut upvalue_captured);
+                    Self::collect_upvalue_captures_in_block(&i.else_block.lock(), &mut upvalue_captured);
                 }
                 Statement::NumericFor(nf) => {
                     Self::collect_reads_in_block_set(&nf.block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&nf.block.lock(), &mut nested_block_writes);
+                    Self::collect_upvalue_captures_in_block(&nf.block.lock(), &mut upvalue_captured);
                 }
                 Statement::GenericFor(gf) => {
                     Self::collect_reads_in_block_set(&gf.block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&gf.block.lock(), &mut nested_block_writes);
+                    Self::collect_upvalue_captures_in_block(&gf.block.lock(), &mut upvalue_captured);
                 }
                 _ => {}
+            }
+
+            // Also collect upvalue captures at current level
+            for rvalue in statement.rvalues() {
+                Self::collect_upvalue_captures(rvalue, &mut upvalue_captured);
             }
 
             // Count uses at the current block level
@@ -624,6 +638,14 @@ impl Inliner {
                     return false;
                 }
 
+                // Never inline locals that are captured as upvalues by closures
+                // Closures need the actual local reference, not just an inlined value
+                // Check by identity or by name for SSA versions
+                if upvalue_captured.contains(local) ||
+                    upvalue_captured.iter().any(|l| l.name().is_some() && l.name() == local.name()) {
+                    return false;
+                }
+
                 // For locals only read in nested blocks:
                 // - Side-effect-free values CAN be inlined (we pass deferred_inlines to nested blocks)
                 // - Side-effect values CANNOT be inlined (would change execution order)
@@ -682,6 +704,51 @@ impl Inliner {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Collect locals captured as upvalues in a block (recursively).
+    fn collect_upvalue_captures_in_block(block: &Block, captured: &mut FxHashSet<RcLocal>) {
+        for statement in &block.0 {
+            // Collect from rvalues in current statement
+            for rvalue in statement.rvalues() {
+                Self::collect_upvalue_captures(rvalue, captured);
+            }
+            // Recurse into nested blocks
+            match statement {
+                Statement::If(i) => {
+                    Self::collect_upvalue_captures_in_block(&i.then_block.lock(), captured);
+                    Self::collect_upvalue_captures_in_block(&i.else_block.lock(), captured);
+                }
+                Statement::While(w) => {
+                    Self::collect_upvalue_captures_in_block(&w.block.lock(), captured);
+                }
+                Statement::Repeat(r) => {
+                    Self::collect_upvalue_captures_in_block(&r.block.lock(), captured);
+                }
+                Statement::NumericFor(nf) => {
+                    Self::collect_upvalue_captures_in_block(&nf.block.lock(), captured);
+                }
+                Statement::GenericFor(gf) => {
+                    Self::collect_upvalue_captures_in_block(&gf.block.lock(), captured);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect locals captured as upvalues in a closure (recursively).
+    fn collect_upvalue_captures(rvalue: &RValue, captured: &mut FxHashSet<RcLocal>) {
+        if let RValue::Closure(closure) = rvalue {
+            for upvalue in &closure.upvalues {
+                let local = match upvalue {
+                    crate::Upvalue::Copy(l) | crate::Upvalue::Ref(l) => l,
+                };
+                captured.insert(local.clone());
+            }
+        }
+        for nested in rvalue.rvalues() {
+            Self::collect_upvalue_captures(nested, captured);
         }
     }
 
