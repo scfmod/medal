@@ -412,19 +412,13 @@ impl Inliner {
                     continue;
                 }
 
-                // For unnamed temporaries, always inline
-                // For named locals, only inline if used in initial position
+                // Only inline if the ASSIGNED local is an unnamed temporary
+                // We don't want to inline named locals (like minX) because that would
+                // replace good names with temporaries (backwards from what we want)
                 let is_unnamed = assign_local.name()
                     .map_or(true, |n| is_unnamed_temporary(&n));
 
-                let should_inline = if is_unnamed {
-                    true
-                } else {
-                    // Named local: only inline into initial position
-                    matches_initial
-                };
-
-                if !should_inline {
+                if !is_unnamed {
                     continue;
                 }
 
