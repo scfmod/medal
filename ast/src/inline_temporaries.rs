@@ -369,6 +369,30 @@ impl Inliner {
     /// This searches backwards from the for-loop to find assignments to locals
     /// used in the for-loop header.
     fn inline_into_numeric_for_loops(&self, block: &mut Block) {
+        // First recurse into nested blocks
+        for stmt in block.0.iter_mut() {
+            match stmt {
+                Statement::If(if_stat) => {
+                    self.inline_into_numeric_for_loops(&mut if_stat.then_block.lock());
+                    self.inline_into_numeric_for_loops(&mut if_stat.else_block.lock());
+                }
+                Statement::While(while_stat) => {
+                    self.inline_into_numeric_for_loops(&mut while_stat.block.lock());
+                }
+                Statement::Repeat(repeat_stat) => {
+                    self.inline_into_numeric_for_loops(&mut repeat_stat.block.lock());
+                }
+                Statement::NumericFor(for_stat) => {
+                    self.inline_into_numeric_for_loops(&mut for_stat.block.lock());
+                }
+                Statement::GenericFor(for_stat) => {
+                    self.inline_into_numeric_for_loops(&mut for_stat.block.lock());
+                }
+                _ => {}
+            }
+        }
+
+        // Now process current block level
         let mut for_idx = 0;
         while for_idx < block.len() {
             let Statement::NumericFor(numeric_for) = &block[for_idx] else {
