@@ -3527,25 +3527,56 @@ fn simplify_set_list_patterns(block: &mut Block) {
             continue;
         }
 
-        // Look for: SetList statement (not a Call)
-        let Some(set_list) = block[i + 1].as_set_list() else {
+        // Search forward for SetList, allowing intervening statements
+        // Intervening statements must be "safe" (assignments that don't touch our local)
+        let mut set_list_idx = None;
+        let mut intervening_indices = Vec::new();
+
+        for j in (i + 1)..block.len().min(i + 10) {
+            // Check if this is the SetList we're looking for
+            if let Some(set_list) = block[j].as_set_list() {
+                let same_local = &set_list.object_local == local
+                    || (set_list.object_local.name().is_some() && set_list.object_local.name() == local.name());
+                if same_local && set_list.index == 1 {
+                    set_list_idx = Some(j);
+                    break;
+                }
+            }
+
+            // Check if this is a safe intervening statement
+            // Safe: assignment that doesn't read or write our table local
+            if let Some(assign) = block[j].as_assign() {
+                // Check if it writes to our local
+                let writes_local = assign.left.iter().any(|lv| {
+                    lv.as_local().map_or(false, |l| {
+                        l == local || (l.name().is_some() && l.name() == local.name())
+                    })
+                });
+                // Check if it reads our local
+                let reads_local = assign.right.iter().any(|rv| {
+                    rv.values_read().iter().any(|l| {
+                        *l == local || (l.name().is_some() && l.name() == local.name())
+                    })
+                });
+
+                if writes_local || reads_local {
+                    // Not safe - our local is used
+                    break;
+                }
+
+                intervening_indices.push(j);
+            } else {
+                // Not an assignment - not safe to skip
+                break;
+            }
+        }
+
+        let Some(set_list_idx) = set_list_idx else {
             i += 1;
             continue;
         };
 
-        // Check if the SetList target is our local
-        let same_local = &set_list.object_local == local
-            || (set_list.object_local.name().is_some() && set_list.object_local.name() == local.name());
-        if !same_local {
-            i += 1;
-            continue;
-        }
-
-        // Index should be 1
-        if set_list.index != 1 {
-            i += 1;
-            continue;
-        }
+        let set_list = block[set_list_idx].as_set_list().unwrap();
 
         // Build the merged table: existing entries + SetList values
         // Table entries are (Option<RValue>, RValue) where None means array-style
@@ -3561,19 +3592,29 @@ fn simplify_set_list_patterns(block: &mut Block) {
         }
         let values_rvalue = RValue::Table(crate::Table(table_entries));
 
-        // Now check the third statement - return v, target = v, or call(v)
+        // The use statement should be right after the SetList
+        let use_idx = set_list_idx + 1;
+        if use_idx >= block.len() {
+            i += 1;
+            continue;
+        }
+
+        // Now check the use statement - return v, target = v, or call(v)
         // Pattern 1: return v
-        if let Some(ret) = block[i + 2].as_return() {
+        if let Some(ret) = block[use_idx].as_return() {
             if ret.values.len() == 1 {
                 if let Some(ret_local) = ret.values[0].as_local() {
                     let same = ret_local == local
                         || (ret_local.name().is_some() && ret_local.name() == local.name());
                     if same {
-                        // Transform: remove first two statements, change return to return {...}
+                        // Transform: remove table init and SetList, change return to return {...}
+                        // Remove in reverse order to keep indices valid
+                        block.0.remove(set_list_idx); // Remove SetList
                         block.0.remove(i); // Remove local v = {}
-                        block.0.remove(i); // Remove SetList
+                        // Adjust use_idx after removals
+                        let new_use_idx = use_idx - 2;
                         // Modify return
-                        if let Statement::Return(ret) = &mut block.0[i] {
+                        if let Statement::Return(ret) = &mut block.0[new_use_idx] {
                             ret.values = vec![values_rvalue];
                         }
                         continue; // Don't increment i, check the new statement at this position
@@ -3583,18 +3624,21 @@ fn simplify_set_list_patterns(block: &mut Block) {
         }
 
         // Pattern 2: target = v
-        if let Some(assign3) = block[i + 2].as_assign() {
+        if let Some(assign3) = block[use_idx].as_assign() {
             if assign3.left.len() == 1 && assign3.right.len() == 1 {
                 if let Some(rhs_local) = assign3.right[0].as_local() {
                     let same = rhs_local == local
                         || (rhs_local.name().is_some() && rhs_local.name() == local.name());
                     if same {
-                        // Transform: remove first two statements, change assignment RHS to {...}
+                        // Transform: remove table init and SetList, change assignment RHS to {...}
                         let target = assign3.left[0].clone();
+                        // Remove in reverse order to keep indices valid
+                        block.0.remove(set_list_idx); // Remove SetList
                         block.0.remove(i); // Remove local v = {}
-                        block.0.remove(i); // Remove SetList
+                        // Adjust use_idx after removals
+                        let new_use_idx = use_idx - 2;
                         // Modify assignment
-                        if let Statement::Assign(assign) = &mut block.0[i] {
+                        if let Statement::Assign(assign) = &mut block.0[new_use_idx] {
                             assign.left = vec![target];
                             assign.right = vec![values_rvalue];
                         }
@@ -3607,7 +3651,7 @@ fn simplify_set_list_patterns(block: &mut Block) {
         // Pattern 3: call(v) or obj:method(v) where v is the only use of the local
         // e.g., curve:addKeyframe(v25_)
         // Get the arguments from the call statement (either Call or MethodCall)
-        let call_arguments: Option<&Vec<RValue>> = match &block[i + 2] {
+        let call_arguments: Option<&Vec<RValue>> = match &block[use_idx] {
             Statement::Call(call) => Some(&call.arguments),
             Statement::MethodCall(mcall) => Some(&mcall.arguments),
             _ => None,
@@ -3631,11 +3675,14 @@ fn simplify_set_list_patterns(block: &mut Block) {
 
             if found_count == 1 {
                 if let Some(arg_idx) = local_arg_idx {
-                    // Transform: remove first two statements, replace local in call with table
-                    block.0.remove(i); // Remove local v = {...}
-                    block.0.remove(i); // Remove SetList
+                    // Transform: remove table init and SetList, replace local in call with table
+                    // Remove in reverse order to keep indices valid
+                    block.0.remove(set_list_idx); // Remove SetList
+                    block.0.remove(i); // Remove local v = {}
+                    // Adjust use_idx after removals
+                    let new_use_idx = use_idx - 2;
                     // Modify the call - replace the local argument with the table
-                    match &mut block.0[i] {
+                    match &mut block.0[new_use_idx] {
                         Statement::Call(call) => {
                             call.arguments[arg_idx] = values_rvalue;
                         }
