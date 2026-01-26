@@ -1,6 +1,9 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{Block, LValue, LocalRw, RValue, RcLocal, Select, SideEffects, Statement, Traverse};
+use crate::{
+    BinaryOperation, Block, LValue, Literal, LocalRw, RValue, RcLocal, Select, SideEffects,
+    Statement, Traverse, UnaryOperation,
+};
 
 /// Maximum recursion depth to prevent stack overflow
 const MAX_DEPTH: usize = 100;
@@ -142,6 +145,13 @@ impl Inliner {
         // to catch these cases (like v69_ = A and B; v69_ = v69_ == C becoming
         // v69_ = A and B == C which is now single-def-single-use).
         inline_single_use_unnamed_temps(block);
+
+        // Simplify patterns like:
+        //   local v23_ = <bool expr>; if v23_ then x = v23_ end
+        // Into:
+        //   if <bool expr> then x = true end
+        // Since inside the then-branch, we know v23_ is truthy (true)
+        simplify_boolean_condition_assignments(block);
 
         // Inline single-use unnamed locals into return statements
         // This handles cases like: local v16_ = expr; return v16_  →  return expr
@@ -1168,7 +1178,7 @@ fn has_side_effects(rvalue: &RValue) -> bool {
     }
 }
 
-use crate::{Assign, BinaryOperation, If, Literal, Unary, UnaryOperation};
+use crate::{Assign, If, Unary};
 
 /// Simplify boolean ternary patterns.
 ///
@@ -3414,17 +3424,11 @@ fn inline_single_use_unnamed_temps(block: &mut Block) {
             continue;
         }
 
-        // Count uses of this local in the rest of the block
+        // Count uses of this local in the rest of the block (including nested blocks)
         let local = local.clone();
         let mut uses = 0;
         for j in (i + 1)..block.len() {
-            for read_local in block[j].values_read() {
-                if read_local == &local
-                    || (read_local.name().is_some() && read_local.name() == local.name())
-                {
-                    uses += 1;
-                }
-            }
+            uses += count_local_uses_recursive(&block[j], &local);
         }
 
         // Must be used exactly once
@@ -3488,6 +3492,296 @@ fn replace_local_with_rvalue(rvalue: &mut RValue, old_local: &RcLocal, new_rvalu
 
     for rv in rvalue.rvalues_mut() {
         replace_local_with_rvalue(rv, old_local, new_rvalue);
+    }
+}
+
+/// Count how many times a local is used in a statement, including nested blocks
+fn count_local_uses_recursive(statement: &Statement, local: &RcLocal) -> usize {
+    let mut count = 0;
+
+    // Count direct uses in this statement
+    for read_local in statement.values_read() {
+        if read_local == local
+            || (read_local.name().is_some() && read_local.name() == local.name())
+        {
+            count += 1;
+        }
+    }
+
+    // Recurse into nested blocks
+    match statement {
+        Statement::If(if_stat) => {
+            for stmt in if_stat.then_block.lock().iter() {
+                count += count_local_uses_recursive(stmt, local);
+            }
+            for stmt in if_stat.else_block.lock().iter() {
+                count += count_local_uses_recursive(stmt, local);
+            }
+        }
+        Statement::While(while_stat) => {
+            for stmt in while_stat.block.lock().iter() {
+                count += count_local_uses_recursive(stmt, local);
+            }
+        }
+        Statement::Repeat(repeat_stat) => {
+            for stmt in repeat_stat.block.lock().iter() {
+                count += count_local_uses_recursive(stmt, local);
+            }
+        }
+        Statement::NumericFor(for_stat) => {
+            for stmt in for_stat.block.lock().iter() {
+                count += count_local_uses_recursive(stmt, local);
+            }
+        }
+        Statement::GenericFor(for_stat) => {
+            for stmt in for_stat.block.lock().iter() {
+                count += count_local_uses_recursive(stmt, local);
+            }
+        }
+        _ => {}
+    }
+
+    count
+}
+
+/// Simplify patterns where a boolean temp is used as both condition and assigned in the body.
+///
+/// Transforms:
+/// ```lua
+/// local v23_ = <bool expr>
+/// if v23_ then
+///     x = v23_
+/// ...
+/// ```
+/// Into:
+/// ```lua
+/// if <bool expr> then
+///     x = true
+/// ...
+/// ```
+///
+/// This works because inside the then-branch, we know v23_ evaluated to a truthy value.
+/// Since v23_ is a boolean expression (not, and, or, comparison), we know it's exactly `true`.
+fn simplify_boolean_condition_assignments(block: &mut Block) {
+    // First recurse into nested blocks and closures
+    for stmt in block.0.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                simplify_boolean_condition_assignments(&mut if_stat.then_block.lock());
+                simplify_boolean_condition_assignments(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                simplify_boolean_condition_assignments(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                simplify_boolean_condition_assignments(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                simplify_boolean_condition_assignments(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                simplify_boolean_condition_assignments(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+        // Also handle closures
+        for rvalue in stmt.rvalues_mut() {
+            simplify_boolean_condition_assignments_in_rvalue(rvalue);
+        }
+    }
+
+    // Now process current block level
+    let mut i = 0;
+    while i + 1 < block.len() {
+        // Check for pattern: local v_ = <bool expr>; if v_ then ... x = v_ ... end
+        let Some(assign) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be single assignment to single local with prefix (local declaration)
+        if assign.left.len() != 1 || assign.right.len() != 1 || !assign.prefix {
+            i += 1;
+            continue;
+        }
+
+        let Some(local) = assign.left[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be unnamed temporary
+        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+        if !is_unnamed {
+            i += 1;
+            continue;
+        }
+
+        // The RHS must be a boolean expression (not, and, or, comparison)
+        let rhs = &assign.right[0];
+        if !is_boolean_expression(rhs) {
+            i += 1;
+            continue;
+        }
+
+        // Clone the local before we drop the borrow
+        let local = local.clone();
+
+        // Check if next statement is an if with local as the condition
+        let Some(if_stat) = block[i + 1].as_if() else {
+            i += 1;
+            continue;
+        };
+
+        // Condition must be exactly the local we just assigned
+        let Some(cond_local) = if_stat.condition.as_local() else {
+            i += 1;
+            continue;
+        };
+
+        let same_local = cond_local == &local
+            || (cond_local.name().is_some() && cond_local.name() == local.name());
+
+        if !same_local {
+            i += 1;
+            continue;
+        }
+
+        // Check uses:
+        // - Once in the condition (which we'll inline)
+        // - The rest in the then-block (which we'll replace with `true`)
+        let uses_in_then = count_local_uses_in_block(&if_stat.then_block.lock(), &local);
+        let uses_in_else = count_local_uses_in_block(&if_stat.else_block.lock(), &local);
+
+        // There should be no uses in else block (doesn't make sense to use a truthy check there)
+        // and at least one use in then block for this optimization to be useful
+        if uses_in_else > 0 || uses_in_then == 0 {
+            i += 1;
+            continue;
+        }
+
+        // Count total uses in the rest of the block (excluding the if we're looking at)
+        let mut uses_after_if = 0;
+        for j in (i + 2)..block.len() {
+            uses_after_if += count_local_uses_recursive(&block[j], &local);
+        }
+
+        // If there are uses after the if, we can't remove the assignment
+        if uses_after_if > 0 {
+            i += 1;
+            continue;
+        }
+
+        // Good to go!
+        // 1. Inline the expression into the if condition
+        // 2. Replace all uses of the local in the then-block with `true`
+        // 3. Remove the assignment
+
+        // Get the expression
+        let expr = {
+            let Statement::Assign(assign) = &block[i] else {
+                unreachable!()
+            };
+            assign.right[0].clone()
+        };
+
+        // Inline into condition
+        if let Statement::If(if_stat) = &mut block[i + 1] {
+            if_stat.condition = expr;
+
+            // Replace all uses in then-block with `true`
+            replace_local_with_true_in_block(&mut if_stat.then_block.lock(), &local);
+        }
+
+        // Remove the assignment
+        block.0.remove(i);
+        // Don't increment i - check the same position again
+        continue;
+    }
+}
+
+fn simplify_boolean_condition_assignments_in_rvalue(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        simplify_boolean_condition_assignments(&mut closure.function.lock().body);
+    }
+    for rv in rvalue.rvalues_mut() {
+        simplify_boolean_condition_assignments_in_rvalue(rv);
+    }
+}
+
+/// Check if an RValue is a boolean expression (produces true/false)
+fn is_boolean_expression(rvalue: &RValue) -> bool {
+    match rvalue {
+        RValue::Unary(unary) => matches!(unary.operation, UnaryOperation::Not),
+        RValue::Binary(binary) => matches!(
+            binary.operation,
+            BinaryOperation::And
+                | BinaryOperation::Or
+                | BinaryOperation::Equal
+                | BinaryOperation::NotEqual
+                | BinaryOperation::LessThan
+                | BinaryOperation::LessThanOrEqual
+                | BinaryOperation::GreaterThan
+                | BinaryOperation::GreaterThanOrEqual
+        ),
+        _ => false,
+    }
+}
+
+/// Count uses of a local in a block (not recursive into nested blocks of statements)
+fn count_local_uses_in_block(block: &Block, local: &RcLocal) -> usize {
+    let mut count = 0;
+    for stmt in block.iter() {
+        count += count_local_uses_recursive(stmt, local);
+    }
+    count
+}
+
+/// Replace all uses of a local with `true` in a block
+fn replace_local_with_true_in_block(block: &mut Block, local: &RcLocal) {
+    for stmt in block.0.iter_mut() {
+        replace_local_with_true_in_statement(stmt, local);
+    }
+}
+
+fn replace_local_with_true_in_statement(statement: &mut Statement, local: &RcLocal) {
+    // Replace in all rvalues
+    for rvalue in statement.rvalues_mut() {
+        replace_local_with_true_in_rvalue(rvalue, local);
+    }
+
+    // Recurse into nested blocks
+    match statement {
+        Statement::If(if_stat) => {
+            replace_local_with_true_in_block(&mut if_stat.then_block.lock(), local);
+            replace_local_with_true_in_block(&mut if_stat.else_block.lock(), local);
+        }
+        Statement::While(while_stat) => {
+            replace_local_with_true_in_block(&mut while_stat.block.lock(), local);
+        }
+        Statement::Repeat(repeat_stat) => {
+            replace_local_with_true_in_block(&mut repeat_stat.block.lock(), local);
+        }
+        Statement::NumericFor(for_stat) => {
+            replace_local_with_true_in_block(&mut for_stat.block.lock(), local);
+        }
+        Statement::GenericFor(for_stat) => {
+            replace_local_with_true_in_block(&mut for_stat.block.lock(), local);
+        }
+        _ => {}
+    }
+}
+
+fn replace_local_with_true_in_rvalue(rvalue: &mut RValue, local: &RcLocal) {
+    if let RValue::Local(l) = rvalue {
+        if l == local || (l.name().is_some() && l.name() == local.name()) {
+            *rvalue = RValue::Literal(Literal::Boolean(true));
+            return;
+        }
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        replace_local_with_true_in_rvalue(rv, local);
     }
 }
 
