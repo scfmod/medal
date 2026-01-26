@@ -145,16 +145,10 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
                         upvalues_in,
                     )));
 
-                    let prev_hook = panic::take_hook();
-                    panic::set_hook(Box::new(|_| {
-                        let trace = Backtrace::capture();
-                        BACKTRACE.with(move |b| b.borrow_mut().replace(trace));
-                    }));
                     let result = panic::catch_unwind(move || {
                         let (ast_function, function, upvalues_in) = args.take().unwrap();
                         decompile_function(ast_function, function, upvalues_in)
                     });
-                    panic::set_hook(prev_hook);
 
                     match result {
                         Ok(r) => r,
@@ -229,29 +223,36 @@ fn decompile_function(
     // the macro could also maybe generate an optimal ordering?
     let mut changed = true;
     let mut iteration = 0;
+    // PERF: Cache dominators and only recalculate when CFG structure changes
+    let mut dominators = simple_fast(function.graph(), function.entry().unwrap());
+    let mut dominators_valid = true;
+
     while changed {
         iteration += 1;
-        if iteration > 100 {
-            // Safety limit to prevent infinite loops
+        if iteration > 20 {
+            // Safety limit - most functions converge within 10 iterations
             break;
         }
         changed = false;
 
-        let dominators = simple_fast(function.graph(), function.entry().unwrap());
-        changed |= structure_jumps(&mut function, &dominators);
+        // Only recalculate dominators if CFG structure changed
+        if !dominators_valid {
+            dominators = simple_fast(function.graph(), function.entry().unwrap());
+            dominators_valid = true;
+        }
+
+        if structure_jumps(&mut function, &dominators) {
+            changed = true;
+            dominators_valid = false;  // CFG changed, invalidate dominators
+        }
 
         ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
-        if structure_conditionals(&mut function)
-        // || {
-        //     let post_dominators = post_dominators(function.graph_mut());
-        //     structure_for_loops(&mut function, &dominators, &post_dominators)
-        // }
-        // we can't structure method calls like this because of __namecall
-        // || structure_method_calls(&mut function)
-        {
+        if structure_conditionals(&mut function) {
             changed = true;
+            dominators_valid = false;  // CFG changed, invalidate dominators
         }
+
         let mut local_map = FxHashMap::default();
         // TODO: loop until returns false?
         if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map) {

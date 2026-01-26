@@ -242,6 +242,9 @@ impl<'a> Destructor<'a> {
 
         for (local, con_class) in &self.congruence_classes {
             let con_class = con_class.borrow();
+            if con_class.is_empty() {
+                continue;
+            }
             // Prefer a local with a debug name if any exists in the congruence class
             // Fall back to the first (by dominator order) if none have names
             let new_local = con_class
@@ -588,7 +591,6 @@ impl<'a> Destructor<'a> {
 
             let con_class_z = self.get_congruence_class(local_c.clone()).clone();
             if con_class_x == con_class_z && con_class_x != con_class_y {
-                println!("WOAH COPY SHARING");
                 return true;
             }
             if con_class_y != con_class_x
@@ -596,7 +598,6 @@ impl<'a> Destructor<'a> {
                 && con_class_x != con_class_z
                 && self.try_coalesce_copy_by_value(local_a.clone(), local_c)
             {
-                println!("WOAH COPY SHARING");
                 return true;
             }
         }

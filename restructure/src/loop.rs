@@ -191,11 +191,11 @@ impl GraphStructurer {
                     } else {
                         true
                     };
-                    if !structure_ok {
+                    if !structure_ok || then_successors.is_empty() {
                         false
                     } else {
                         let else_successors = self.function.successor_blocks(else_node).collect_vec();
-                        (!then_successors.is_empty() && then_successors[0] == else_node)
+                        (then_successors[0] == else_node)
                             || (else_successors.len() == 1 && then_successors[0] == else_successors[0])
                             || (then_successors[0] == header && else_node == init_block)
                     }
