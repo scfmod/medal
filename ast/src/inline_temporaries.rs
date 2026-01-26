@@ -137,6 +137,12 @@ impl Inliner {
         // which only become apparent after inlining collapses v17_ = math.abs(...) into the condition
         simplify_and_chains(block);
 
+        // After simplify_and_chains collapses split assignments, some unnamed temps
+        // become single-def-single-use and can now be inlined. Run a targeted pass
+        // to catch these cases (like v69_ = A and B; v69_ = v69_ == C becoming
+        // v69_ = A and B == C which is now single-def-single-use).
+        inline_single_use_unnamed_temps(block);
+
         // Inline single-use unnamed locals into return statements
         // This handles cases like: local v16_ = expr; return v16_  →  return expr
         inline_into_returns(block);
@@ -3311,6 +3317,153 @@ fn replace_local_in_rvalue(rvalue: &mut RValue, old: &RcLocal, new: &RcLocal) {
 
     for rv in rvalue.rvalues_mut() {
         replace_local_in_rvalue(rv, old, new);
+    }
+}
+
+/// Inline single-use unnamed temporaries after and-chain simplification.
+///
+/// After `simplify_and_chains` runs, some unnamed temps that were previously
+/// defined multiple times become single-def-single-use. This pass catches
+/// those cases and inlines them.
+///
+/// Pattern:
+/// ```lua
+/// local v69_ = A and B == C   -- single definition now
+/// hotspot:setVisible(v69_)    -- single use
+/// ```
+/// Into:
+/// ```lua
+/// hotspot:setVisible(A and B == C)
+/// ```
+fn inline_single_use_unnamed_temps(block: &mut Block) {
+    // First recurse into nested blocks and closures
+    for stmt in block.0.iter_mut() {
+        match stmt {
+            Statement::If(if_stat) => {
+                inline_single_use_unnamed_temps(&mut if_stat.then_block.lock());
+                inline_single_use_unnamed_temps(&mut if_stat.else_block.lock());
+            }
+            Statement::While(while_stat) => {
+                inline_single_use_unnamed_temps(&mut while_stat.block.lock());
+            }
+            Statement::Repeat(repeat_stat) => {
+                inline_single_use_unnamed_temps(&mut repeat_stat.block.lock());
+            }
+            Statement::NumericFor(for_stat) => {
+                inline_single_use_unnamed_temps(&mut for_stat.block.lock());
+            }
+            Statement::GenericFor(for_stat) => {
+                inline_single_use_unnamed_temps(&mut for_stat.block.lock());
+            }
+            _ => {}
+        }
+        // Also handle closures
+        for rvalue in stmt.rvalues_mut() {
+            inline_single_use_unnamed_temps_in_rvalue(rvalue);
+        }
+    }
+
+    // Now process current block level
+    let mut i = 0;
+    while i + 1 < block.len() {
+        // Check for pattern: local v_ = expr; next_stmt uses v_ exactly once
+        let Some(assign) = block[i].as_assign() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be single assignment to single local with prefix (local declaration)
+        if assign.left.len() != 1 || assign.right.len() != 1 || !assign.prefix {
+            i += 1;
+            continue;
+        }
+
+        let Some(local) = assign.left[0].as_local() else {
+            i += 1;
+            continue;
+        };
+
+        // Must be unnamed temporary
+        let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
+        if !is_unnamed {
+            i += 1;
+            continue;
+        }
+
+        // Count uses of this local in the rest of the block
+        let local = local.clone();
+        let mut uses = 0;
+        for j in (i + 1)..block.len() {
+            for read_local in block[j].values_read() {
+                if read_local == &local
+                    || (read_local.name().is_some() && read_local.name() == local.name())
+                {
+                    uses += 1;
+                }
+            }
+        }
+
+        // Must be used exactly once
+        if uses != 1 {
+            i += 1;
+            continue;
+        }
+
+        // Check if the next statement uses this local
+        let reads = block[i + 1].values_read();
+        let next_uses = reads
+            .iter()
+            .filter(|l| **l == &local || (l.name().is_some() && l.name() == local.name()))
+            .count();
+
+        if next_uses == 1 {
+            // Inline the expression
+            let rvalue = {
+                let Statement::Assign(assign) = &block[i] else {
+                    unreachable!()
+                };
+                assign.right[0].clone()
+            };
+
+            // Replace the local with the expression in the next statement
+            inline_local_in_statement(&mut block[i + 1], &local, &rvalue);
+
+            // Remove the assignment
+            block.0.remove(i);
+            // Don't increment i - check the same position again
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+fn inline_single_use_unnamed_temps_in_rvalue(rvalue: &mut RValue) {
+    if let RValue::Closure(closure) = rvalue {
+        inline_single_use_unnamed_temps(&mut closure.function.lock().body);
+    }
+    for rv in rvalue.rvalues_mut() {
+        inline_single_use_unnamed_temps_in_rvalue(rv);
+    }
+}
+
+fn inline_local_in_statement(statement: &mut Statement, old_local: &RcLocal, new_rvalue: &RValue) {
+    // Replace in all rvalues of the statement
+    for rvalue in statement.rvalues_mut() {
+        replace_local_with_rvalue(rvalue, old_local, new_rvalue);
+    }
+}
+
+fn replace_local_with_rvalue(rvalue: &mut RValue, old_local: &RcLocal, new_rvalue: &RValue) {
+    if let RValue::Local(local) = rvalue {
+        if local == old_local || (local.name().is_some() && local.name() == old_local.name()) {
+            *rvalue = new_rvalue.clone();
+            return;
+        }
+    }
+
+    for rv in rvalue.rvalues_mut() {
+        replace_local_with_rvalue(rv, old_local, new_rvalue);
     }
 }
 
