@@ -13,7 +13,7 @@ use petgraph::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 
-use crate::{Assign, Block, LocalRw, RcLocal, Statement};
+use crate::{Assign, Block, LocalRw, RValue, RcLocal, Statement, Traverse, Upvalue};
 
 #[derive(Default)]
 pub struct LocalDeclarer {
@@ -24,21 +24,55 @@ pub struct LocalDeclarer {
 }
 
 impl LocalDeclarer {
+    /// Recursively collect upvalue locals from closures within an rvalue.
+    /// This handles nested closures and closures inside tables, calls, etc.
+    fn collect_closure_upvalues(
+        rvalue: &RValue,
+        local_usages: &mut IndexMap<RcLocal, FxHashMap<NodeIndex, usize>>,
+        node: NodeIndex,
+        stat_index: usize,
+    ) {
+        match rvalue {
+            RValue::Closure(closure) => {
+                for upvalue in &closure.upvalues {
+                    let local = match upvalue {
+                        Upvalue::Copy(l) | Upvalue::Ref(l) => l,
+                    };
+                    local_usages
+                        .entry(local.clone())
+                        .or_default()
+                        .entry(node)
+                        .or_insert(stat_index);
+                }
+            }
+            _ => {}
+        }
+        // Recursively check nested rvalues (e.g., closures inside tables)
+        for nested in rvalue.rvalues() {
+            Self::collect_closure_upvalues(nested, local_usages, node, stat_index);
+        }
+    }
+
     fn visit(&mut self, block: Arc<Mutex<Block>>, stat_index: usize) -> NodeIndex {
         let node = self.graph.add_node((Some(block.clone()), stat_index));
         self.block_to_node.insert(block.clone().into(), node);
         for (stat_index, stat) in block.lock().iter().enumerate() {
             // for loops already declare their own locals :)
             if !matches!(stat, Statement::GenericFor(_) | Statement::NumericFor(_)) {
-                // we only visit locals written because locals are guaranteed to be written
-                // before they are read.
-                // TODO: move to seperate function and visit breadth-first?
+                // Track locals that are written to
                 for local in stat.values_written() {
                     self.local_usages
                         .entry(local.clone())
                         .or_default()
                         .entry(node)
                         .or_insert(stat_index);
+                }
+                // Also track locals that are captured as upvalues in closures.
+                // These locals need to be declared even if they're never directly
+                // written to in this scope (they may only be initialized in the
+                // outer scope and then captured).
+                for rvalue in stat.rvalues() {
+                    Self::collect_closure_upvalues(rvalue, &mut self.local_usages, node, stat_index);
                 }
             }
             match stat {
