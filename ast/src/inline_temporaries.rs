@@ -559,8 +559,19 @@ impl Inliner {
             }
 
             // Count uses at the current block level
+            // Note: We need to skip upvalue captures in closures - those locals must
+            // not be inlined because the closure captures a reference to the local,
+            // not just its value. If we inline, the closure would capture a literal
+            // instead of a mutable reference.
             for local in statement.values_read() {
                 *current_level_uses.entry(local.clone()).or_default() += 1;
+            }
+            // Subtract closure upvalue captures from use count for ALL statements
+            // (not just assigns - closures can appear in returns, calls, etc.)
+            // Closures capture a reference to a local, not its value, so these
+            // shouldn't be counted as "uses" for inlining purposes.
+            for rvalue in statement.rvalues() {
+                Self::subtract_closure_upvalue_counts(rvalue, &mut current_level_uses);
             }
         }
 
@@ -671,6 +682,36 @@ impl Inliner {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Subtract upvalue captures from use counts. Closures capture a reference
+    /// to a local, not its value, so these shouldn't be counted as "uses" for
+    /// inlining purposes.
+    fn subtract_closure_upvalue_counts(rvalue: &RValue, current_level_uses: &mut FxHashMap<RcLocal, usize>) {
+        if let RValue::Closure(closure) = rvalue {
+            for upvalue in &closure.upvalues {
+                let local = match upvalue {
+                    crate::Upvalue::Copy(l) | crate::Upvalue::Ref(l) => l,
+                };
+                // Subtract the upvalue capture from use count
+                if let Some(count) = current_level_uses.get_mut(local) {
+                    *count = count.saturating_sub(1);
+                }
+                // Also try by name for SSA versions
+                if local.name().is_some() {
+                    let name = local.name();
+                    for (l, count) in current_level_uses.iter_mut() {
+                        if l.name() == name && l != local {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        }
+        // Recurse into nested rvalues (e.g., closures inside tables)
+        for nested in rvalue.rvalues() {
+            Self::subtract_closure_upvalue_counts(nested, current_level_uses);
         }
     }
 
@@ -2897,6 +2938,11 @@ fn collect_local_usage_in_rvalue(
     reads: &mut FxHashSet<RcLocal>,
     writes: &mut FxHashMap<RcLocal, Vec<usize>>,
 ) {
+    // Collect reads from this rvalue itself (e.g., upvalues captured by closures)
+    for local in rvalue.values_read() {
+        reads.insert(local.clone());
+    }
+
     if let RValue::Closure(closure) = rvalue {
         collect_local_usage(&closure.function.lock().body, reads, writes, 0);
     }

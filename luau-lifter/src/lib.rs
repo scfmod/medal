@@ -199,6 +199,12 @@ fn decompile_function(
 ) -> (ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>) {
     let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
         cfg::ssa::construct(&mut function, &upvalues_in);
+    // Collect upvalues coming IN (from parent) - these will be ignored for declaration
+    let upvalue_in_locals: FxHashSet<ast::RcLocal> = upvalue_in_groups
+        .iter()
+        .flat_map(|(_, g)| g.iter().cloned())
+        .collect();
+
     let upvalue_to_group = upvalue_in_groups
         .into_iter()
         .chain(
@@ -267,9 +273,14 @@ fn decompile_function(
     let mut locals_to_ignore: FxHashSet<ast::RcLocal> = upvalues_in.iter().cloned().collect();
     locals_to_ignore.extend(function.parameters.iter().cloned());
 
-    // Add all SSA versions of upvalues (these are tracked in upvalue_to_group)
+    // Add SSA versions of upvalues coming IN (from parent scope) - these should not be declared.
+    // But DO NOT add upvalues being passed OUT to child closures - those are locals defined
+    // in THIS function that need to be declared.
     for (ssa_version, _) in &upvalue_to_group {
-        locals_to_ignore.insert(ssa_version.clone());
+        // Only ignore if this is an incoming upvalue, not a passed-out one
+        if upvalue_in_locals.contains(ssa_version) {
+            locals_to_ignore.insert(ssa_version.clone());
+        }
     }
 
     // Also check local_to_group for SSA versions of parameters
