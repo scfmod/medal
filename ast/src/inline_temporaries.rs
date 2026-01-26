@@ -3617,9 +3617,15 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
             continue;
         }
 
-        // The RHS must be a boolean expression (not, and, or, comparison)
+        // The RHS should ideally be a boolean expression (not, and, or, comparison)
+        // But we also allow function calls since the pattern `local v = f(); if v then x = v`
+        // is common and can be simplified to `if f() then x = true` when v is only used
+        // in these two places. Inside `if v then`, v is truthy, so replacing with `true` is safe.
         let rhs = &assign.right[0];
-        if !is_boolean_expression(rhs) {
+        let is_boolean_expr = is_boolean_expression(rhs);
+        // Allow function calls (Call, MethodCall) and Select (for multi-return calls)
+        let is_call_like = matches!(rhs, RValue::Call(_) | RValue::MethodCall(_) | RValue::Select(_));
+        if !is_boolean_expr && !is_call_like {
             i += 1;
             continue;
         }
@@ -3633,8 +3639,24 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
             continue;
         };
 
-        // Condition must be exactly the local we just assigned
-        let Some(cond_local) = if_stat.condition.as_local() else {
+        // Condition must be the local we just assigned, or `not local`
+        // For `if v then`, uses in then-block get replaced with true
+        // For `if not v then`, uses in then-block get replaced with false
+        let (cond_local, is_negated) = if let Some(l) = if_stat.condition.as_local() {
+            (l, false)
+        } else if let Some(unary) = if_stat.condition.as_unary() {
+            if matches!(unary.operation, UnaryOperation::Not) {
+                if let Some(l) = unary.value.as_local() {
+                    (l, true)
+                } else {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                i += 1;
+                continue;
+            }
+        } else {
             i += 1;
             continue;
         };
@@ -3648,8 +3670,8 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
         }
 
         // Check uses:
-        // - Once in the condition (which we'll inline)
-        // - The rest in the then-block (which we'll replace with `true`)
+        // For `if v then`: uses in then-block get replaced with `true`
+        // For `if not v then`: uses in then-block get replaced with `false`
         let uses_in_then = count_local_uses_in_block(&if_stat.then_block.lock(), &local);
         let uses_in_else = count_local_uses_in_block(&if_stat.else_block.lock(), &local);
 
@@ -3666,6 +3688,7 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
             uses_after_if += count_local_uses_recursive(&block[j], &local);
         }
 
+
         // If there are uses after the if, we can't remove the assignment
         if uses_after_if > 0 {
             i += 1;
@@ -3673,8 +3696,10 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
         }
 
         // Good to go!
-        // 1. Inline the expression into the if condition
-        // 2. Replace all uses of the local in the then-block with `true`
+        // 1. Inline the expression into the if condition (keeping negation if present)
+        // 2. Replace all uses of the local in the then-block with appropriate boolean
+        //    - For `if v then`: replace with `true`
+        //    - For `if not v then`: replace with `false`
         // 3. Remove the assignment
 
         // Get the expression
@@ -3685,12 +3710,23 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
             assign.right[0].clone()
         };
 
-        // Inline into condition
+        // Inline into condition (wrap in `not` if original was negated)
         if let Statement::If(if_stat) = &mut block[i + 1] {
-            if_stat.condition = expr;
+            if is_negated {
+                if_stat.condition = RValue::Unary(Unary {
+                    operation: UnaryOperation::Not,
+                    value: Box::new(expr),
+                });
+            } else {
+                if_stat.condition = expr;
+            }
 
-            // Replace all uses in then-block with `true`
-            replace_local_with_true_in_block(&mut if_stat.then_block.lock(), &local);
+            // Replace all uses in then-block with appropriate boolean
+            if is_negated {
+                replace_local_with_false_in_block(&mut if_stat.then_block.lock(), &local);
+            } else {
+                replace_local_with_true_in_block(&mut if_stat.then_block.lock(), &local);
+            }
         }
 
         // Remove the assignment
@@ -3739,49 +3775,58 @@ fn count_local_uses_in_block(block: &Block, local: &RcLocal) -> usize {
 
 /// Replace all uses of a local with `true` in a block
 fn replace_local_with_true_in_block(block: &mut Block, local: &RcLocal) {
+    replace_local_with_bool_in_block(block, local, true);
+}
+
+/// Replace all uses of a local with `false` in a block
+fn replace_local_with_false_in_block(block: &mut Block, local: &RcLocal) {
+    replace_local_with_bool_in_block(block, local, false);
+}
+
+fn replace_local_with_bool_in_block(block: &mut Block, local: &RcLocal, value: bool) {
     for stmt in block.0.iter_mut() {
-        replace_local_with_true_in_statement(stmt, local);
+        replace_local_with_bool_in_statement(stmt, local, value);
     }
 }
 
-fn replace_local_with_true_in_statement(statement: &mut Statement, local: &RcLocal) {
+fn replace_local_with_bool_in_statement(statement: &mut Statement, local: &RcLocal, value: bool) {
     // Replace in all rvalues
     for rvalue in statement.rvalues_mut() {
-        replace_local_with_true_in_rvalue(rvalue, local);
+        replace_local_with_bool_in_rvalue(rvalue, local, value);
     }
 
     // Recurse into nested blocks
     match statement {
         Statement::If(if_stat) => {
-            replace_local_with_true_in_block(&mut if_stat.then_block.lock(), local);
-            replace_local_with_true_in_block(&mut if_stat.else_block.lock(), local);
+            replace_local_with_bool_in_block(&mut if_stat.then_block.lock(), local, value);
+            replace_local_with_bool_in_block(&mut if_stat.else_block.lock(), local, value);
         }
         Statement::While(while_stat) => {
-            replace_local_with_true_in_block(&mut while_stat.block.lock(), local);
+            replace_local_with_bool_in_block(&mut while_stat.block.lock(), local, value);
         }
         Statement::Repeat(repeat_stat) => {
-            replace_local_with_true_in_block(&mut repeat_stat.block.lock(), local);
+            replace_local_with_bool_in_block(&mut repeat_stat.block.lock(), local, value);
         }
         Statement::NumericFor(for_stat) => {
-            replace_local_with_true_in_block(&mut for_stat.block.lock(), local);
+            replace_local_with_bool_in_block(&mut for_stat.block.lock(), local, value);
         }
         Statement::GenericFor(for_stat) => {
-            replace_local_with_true_in_block(&mut for_stat.block.lock(), local);
+            replace_local_with_bool_in_block(&mut for_stat.block.lock(), local, value);
         }
         _ => {}
     }
 }
 
-fn replace_local_with_true_in_rvalue(rvalue: &mut RValue, local: &RcLocal) {
+fn replace_local_with_bool_in_rvalue(rvalue: &mut RValue, local: &RcLocal, value: bool) {
     if let RValue::Local(l) = rvalue {
         if l == local || (l.name().is_some() && l.name() == local.name()) {
-            *rvalue = RValue::Literal(Literal::Boolean(true));
+            *rvalue = RValue::Literal(Literal::Boolean(value));
             return;
         }
     }
 
     for rv in rvalue.rvalues_mut() {
-        replace_local_with_true_in_rvalue(rv, local);
+        replace_local_with_bool_in_rvalue(rv, local, value);
     }
 }
 
