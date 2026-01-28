@@ -5,9 +5,9 @@ use parking_lot::Mutex;
 use triomphe::Arc;
 
 use crate::{
+    Block, Literal, LocalRw, RcLocal, Reduce, SideEffects, Traverse, Type,
     formatter::Formatter,
     type_system::{Infer, TypeSystem},
-    Block, Literal, LocalRw, RcLocal, Reduce, SideEffects, Traverse, Type,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -22,6 +22,7 @@ pub struct Function {
     pub parameters: Vec<RcLocal>,
     pub is_variadic: bool,
     pub body: Block,
+    pub line_info: (usize, usize),
 }
 
 #[derive(Debug, PartialEq, Clone)]

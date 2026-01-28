@@ -33,13 +33,13 @@ pub struct Function {
     pub instructions: Vec<Instruction>,
     pub constants: Vec<Constant>,
     pub functions: Vec<usize>,
-    pub line_defined: usize,
+    pub line_info: (usize, usize), // line defined, last line
     pub function_name: usize,
     pub line_gap_log2: Option<u8>,
     pub line_info_delta: Option<Vec<u8>>,
     pub abs_line_info_delta: Option<Vec<u32>>,
     pub local_debug_info: Vec<LocalDebugInfo>,
-    pub upvalue_debug_names: Vec<usize>,  // name indices for upvalues (1-based, 0 = no name)
+    pub upvalue_debug_names: Vec<usize>, // name indices for upvalues (1-based, 0 = no name)
 }
 
 impl Function {
@@ -128,7 +128,7 @@ impl Function {
         let (input, is_vararg) = le_u8(input)?;
 
         let input = if version >= 4 {
-            let (t_input, flags) = le_u8(input)?;
+            let (t_input, _flags) = le_u8(input)?;
             let (t_input, _) = parse_list(t_input, le_u8)?;
             t_input
         } else {
@@ -158,15 +158,33 @@ impl Function {
                 (input, Some(line_info_delta))
             }
         };
-        let (input, abs_line_info_delta) = match has_line_info {
-            0 => (input, None),
-            _ => {
+
+        let mut last_line: usize = 0;
+
+        let (input, abs_line_info_delta, last_line) = match &line_info_delta {
+            None => (input, None, 0),
+            Some(line_info_delta) => {
                 let (input, abs_line_info_delta) = parse_list_len(
                     input,
                     le_u32,
                     ((u32_instructions.len() - 1) >> line_gap_log2.unwrap()) + 1,
                 )?;
-                (input, Some(abs_line_info_delta))
+
+                let mut last_offset: u8 = 0;
+                for value in line_info_delta.iter() {
+                    last_offset = last_offset.wrapping_add(*value);
+                }
+
+                let mut last_line = 0;
+                for value in abs_line_info_delta.iter() {
+                    last_line += *value as usize;
+                }
+
+                (
+                    input,
+                    Some(abs_line_info_delta),
+                    last_line + last_offset as usize,
+                )
             }
         };
         let (input, (local_debug_info, upvalue_debug_names)) = match le_u8(input)? {
@@ -207,7 +225,7 @@ impl Function {
                 instructions,
                 constants,
                 functions,
-                line_defined,
+                line_info: (line_defined, last_line),
                 function_name,
                 line_gap_log2,
                 line_info_delta,
