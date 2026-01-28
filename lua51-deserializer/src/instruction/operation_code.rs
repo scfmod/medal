@@ -1,3 +1,5 @@
+#![allow(non_local_definitions)]
+
 use crate::instruction::layout::LayoutDiscriminants;
 use nom::{
     Err, IResult,
