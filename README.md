@@ -1,7 +1,3 @@
-____
-Looking for coder(s) to implement proper use of debug information for naming locals and parameters.
-____
-
 Make sure you have nightly version installed
 ```
 rustup install nightly
@@ -9,12 +5,12 @@ rustup install nightly
 
 Run luau-lifter
 ```
-cargo +nightly run --bin luau-lifter <file>
+cargo run --bin luau-lifter <file>
 ```
 
 Build luau-lifter.exe
 ```
-cargo +nightly build --bin luau-lifter --release
+cargo build --bin luau-lifter --release
 ```
 
 
