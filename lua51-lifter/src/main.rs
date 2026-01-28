@@ -1,9 +1,8 @@
 #![feature(box_patterns)]
-#![feature(let_chains)]
 
 use ast::{
-    local_declarations::LocalDeclarer, name_locals::name_locals, replace_locals::replace_locals,
-    Traverse,
+    Traverse, local_declarations::LocalDeclarer, name_locals::name_locals,
+    replace_locals::replace_locals,
 };
 use by_address::ByAddress;
 use cfg::ssa::{
@@ -14,8 +13,6 @@ use indexmap::IndexMap;
 use lifter::Lifter;
 use parking_lot::Mutex;
 use petgraph::algo::dominators::simple_fast;
-use rayon::iter::ParallelIterator;
-use rayon::prelude::IntoParallelIterator;
 use rustc_hash::FxHashMap;
 use std::{
     fs::File,

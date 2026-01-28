@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::iter;
 use std::{
     borrow::Cow,
@@ -372,7 +371,11 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 self.format_rvalue(&index.left)?;
                 // Use : instead of . for the method name
                 if let box RValue::Literal(Literal::String(method_name)) = &index.right {
-                    write!(self.output, ":{}", std::str::from_utf8(method_name).unwrap_or("?"))?;
+                    write!(
+                        self.output,
+                        ":{}",
+                        std::str::from_utf8(method_name).unwrap_or("?")
+                    )?;
                 } else {
                     // Fallback for non-string keys (shouldn't happen for valid method names)
                     write!(self.output, ":")?;
@@ -471,7 +474,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     // TODO: PERF: Cow like from_utf8_lossy
-    pub(crate) fn escape_string(string: &[u8]) -> Cow<str> {
+    pub(crate) fn escape_string(string: &[u8]) -> Cow<'_, str> {
         let mut owned: Option<String> = None;
         let mut iter = string.iter().enumerate().peekable();
         while let Some((i, &c)) = iter.next() {

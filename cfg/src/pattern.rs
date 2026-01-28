@@ -1,9 +1,9 @@
 use std::fmt;
 
 use petgraph::{
+    Direction,
     stable_graph::{NodeIndex, StableDiGraph},
     visit::{Dfs, EdgeRef, Walker},
-    Direction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 

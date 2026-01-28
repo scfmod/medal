@@ -1,8 +1,8 @@
 use crate::instruction::layout::LayoutDiscriminants;
 use nom::{
+    Err, IResult,
     error::{Error, ErrorKind, ParseError},
     number::complete::le_u8,
-    Err, IResult,
 };
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::FromPrimitive;
@@ -61,7 +61,7 @@ impl OperationCode {
                     return Err(Err::Failure(Error::from_error_kind(
                         input,
                         ErrorKind::Switch,
-                    )))
+                    )));
                 }
                 Some(operation_code) => operation_code,
             },

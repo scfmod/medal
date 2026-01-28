@@ -4,9 +4,9 @@ use ast::{LocalRw, RcLocal, Traverse};
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use petgraph::{
+    Direction,
     stable_graph::NodeIndex,
     visit::{Dfs, EdgeRef, Walker},
-    Direction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -277,79 +277,79 @@ impl<'a> SsaConstructor<'a> {
         param_local
     }
 
-    fn try_remove_trivial_param(&mut self, node: NodeIndex, param_local: RcLocal) -> RcLocal {
-        let mut same = None;
-        let args_in = self.function.edges_to_block(node).map(|(_, e)| {
-            &e.arguments
-                .iter()
-                .find(|(p, _)| p == &param_local)
-                .unwrap()
-                .1
-        });
-        for arg in args_in {
-            let mut arg = arg.as_local().unwrap();
-            while let Some(arg_to) = self.local_map.get(arg) {
-                arg = arg_to;
-            }
+    // fn try_remove_trivial_param(&mut self, node: NodeIndex, param_local: RcLocal) -> RcLocal {
+    //     let mut same = None;
+    //     let args_in = self.function.edges_to_block(node).map(|(_, e)| {
+    //         &e.arguments
+    //             .iter()
+    //             .find(|(p, _)| p == &param_local)
+    //             .unwrap()
+    //             .1
+    //     });
+    //     for arg in args_in {
+    //         let mut arg = arg.as_local().unwrap();
+    //         while let Some(arg_to) = self.local_map.get(arg) {
+    //             arg = arg_to;
+    //         }
 
-            if Some(&arg) == same.as_ref() || arg == &param_local {
-                // unique value or self-reference
-                continue;
-            }
-            if same.is_some() {
-                // the param merges at least two values: not trivial
-                return param_local;
-            }
-            same = Some(arg);
-        }
-        let same = same.unwrap().clone();
-        self.local_map.insert(param_local.clone(), same.clone());
+    //         if Some(&arg) == same.as_ref() || arg == &param_local {
+    //             // unique value or self-reference
+    //             continue;
+    //         }
+    //         if same.is_some() {
+    //             // the param merges at least two values: not trivial
+    //             return param_local;
+    //         }
+    //         same = Some(arg);
+    //     }
+    //     let same = same.unwrap().clone();
+    //     self.local_map.insert(param_local.clone(), same.clone());
 
-        // TODO: optimize
-        for node in self.function.graph().node_indices().collect::<Vec<_>>() {
-            let mut edges = self
-                .function
-                .edges_to_block(node)
-                .map(|(_, e)| e)
-                .peekable();
-            if edges
-                .peek()
-                .map(|e| !e.arguments.is_empty())
-                .unwrap_or(false)
-            {
-                let edges = edges.collect::<Vec<_>>();
-                if edges.iter().any(|e| {
-                    e.arguments
-                        .iter()
-                        .any(|(_, a)| a.as_local().unwrap() == &param_local)
-                }) {
-                    let params_in = edges
-                        .into_iter()
-                        .map(|e| {
-                            e.arguments
-                                .iter()
-                                .map(|(p, _)| p)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>();
-                    for mut param in params_in[0].iter() {
-                        while let Some(param_to) = self.local_map.get(param) {
-                            param = param_to;
-                        }
+    //     // TODO: optimize
+    //     for node in self.function.graph().node_indices().collect::<Vec<_>>() {
+    //         let mut edges = self
+    //             .function
+    //             .edges_to_block(node)
+    //             .map(|(_, e)| e)
+    //             .peekable();
+    //         if edges
+    //             .peek()
+    //             .map(|e| !e.arguments.is_empty())
+    //             .unwrap_or(false)
+    //         {
+    //             let edges = edges.collect::<Vec<_>>();
+    //             if edges.iter().any(|e| {
+    //                 e.arguments
+    //                     .iter()
+    //                     .any(|(_, a)| a.as_local().unwrap() == &param_local)
+    //             }) {
+    //                 let params_in = edges
+    //                     .into_iter()
+    //                     .map(|e| {
+    //                         e.arguments
+    //                             .iter()
+    //                             .map(|(p, _)| p)
+    //                             .cloned()
+    //                             .collect::<Vec<_>>()
+    //                     })
+    //                     .collect::<Vec<_>>();
+    //                 for mut param in params_in[0].iter() {
+    //                     while let Some(param_to) = self.local_map.get(param) {
+    //                         param = param_to;
+    //                     }
 
-                        if param == &param_local
-                            || params_in.iter().any(|e| e.iter().any(|p| p == param))
-                        {
-                            self.try_remove_trivial_param(node, param.clone());
-                        }
-                    }
-                }
-            }
-        }
+    //                     if param == &param_local
+    //                         || params_in.iter().any(|e| e.iter().any(|p| p == param))
+    //                     {
+    //                         self.try_remove_trivial_param(node, param.clone());
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
 
-        same
-    }
+    //     same
+    // }
 
     fn find_local(&mut self, node: NodeIndex, local: &RcLocal) -> RcLocal {
         let res = if let Some(new_local) = self
@@ -663,10 +663,12 @@ pub fn construct(
     // if entry has predecessors, this might risk it never being incomplete
     // resulting in broken params
     // TODO: verify ^ and insert temporary entry that's removed if there is no block params (if its an issue)
-    assert!(function
-        .predecessor_blocks(function.entry().unwrap())
-        .next()
-        .is_none());
+    assert!(
+        function
+            .predecessor_blocks(function.entry().unwrap())
+            .next()
+            .is_none()
+    );
     let mut new_upvalues_in = IndexMap::with_capacity(upvalues_in.len());
     for upvalue in upvalues_in {
         new_upvalues_in.insert(upvalue.clone(), FxHashSet::default());

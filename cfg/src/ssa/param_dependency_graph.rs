@@ -1,11 +1,6 @@
 use ast::{LocalRw, RcLocal};
-use indexmap::IndexSet;
-use petgraph::{
-    prelude::DiGraph,
-    stable_graph::NodeIndex,
-    visit::{DfsPostOrder, Walker},
-};
-use rustc_hash::{FxHashMap, FxHashSet};
+use petgraph::{prelude::DiGraph, stable_graph::NodeIndex};
+use rustc_hash::FxHashMap;
 
 use crate::function::Function;
 
@@ -64,28 +59,28 @@ impl ParamDependencyGraph {
 
     // This function computes a directed feedback vertex (directed fvs) set of a given graph.
     // Since this problem is NP-hard, we only compute an approximate solution.
-    pub fn compute_directed_fvs(&self) -> IndexSet<NodeIndex> {
-        let mut directed_fvs = IndexSet::new();
-        let mut dfs_post_order = DfsPostOrder::empty(&self.graph);
-        dfs_post_order.stack.extend(self.graph.node_indices());
-        let mut topological_order = dfs_post_order.iter(&self.graph).collect::<Vec<_>>();
-        topological_order.reverse();
+    // pub fn compute_directed_fvs(&self) -> IndexSet<NodeIndex> {
+    //     let mut directed_fvs = IndexSet::new();
+    //     let mut dfs_post_order = DfsPostOrder::empty(&self.graph);
+    //     dfs_post_order.stack.extend(self.graph.node_indices());
+    //     let mut topological_order = dfs_post_order.iter(&self.graph).collect::<Vec<_>>();
+    //     topological_order.reverse();
 
-        let mut smaller_order = FxHashSet::default();
-        for node in topological_order {
-            if self
-                .graph
-                .neighbors(node)
-                .any(|n| smaller_order.contains(&n))
-            {
-                directed_fvs.insert(node);
-            } else {
-                smaller_order.insert(node);
-            }
-        }
+    //     let mut smaller_order = FxHashSet::default();
+    //     for node in topological_order {
+    //         if self
+    //             .graph
+    //             .neighbors(node)
+    //             .any(|n| smaller_order.contains(&n))
+    //         {
+    //             directed_fvs.insert(node);
+    //         } else {
+    //             smaller_order.insert(node);
+    //         }
+    //     }
 
-        directed_fvs
-    }
+    //     directed_fvs
+    // }
 }
 
 // TODO: fix

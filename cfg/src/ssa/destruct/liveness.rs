@@ -1,7 +1,7 @@
 use ast::{LocalRw, RcLocal};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use petgraph::{stable_graph::NodeIndex, visit::Walker};
+use petgraph::stable_graph::NodeIndex;
 
 use crate::function::Function;
 

@@ -1,4 +1,4 @@
-use crate::{Assign, Binary, BinaryOperation, Block, If, LValue, RValue, Statement, Traverse};
+use crate::{Assign, Binary, BinaryOperation, Block, If, RValue, Statement, Traverse};
 
 /// Cleans up any remaining NumForInit/NumForNext/GenericForInit/GenericForNext statements
 /// that weren't successfully structured into proper for loops.
@@ -22,18 +22,11 @@ pub fn cleanup_for_statements(block: &mut Block) {
         match &block[i] {
             Statement::NumForInit(nfi) => {
                 // Convert NumForInit to three assignments
-                let counter_assign = Assign::new(
-                    vec![nfi.counter.0.clone()],
-                    vec![nfi.counter.1.clone()],
-                );
-                let limit_assign = Assign::new(
-                    vec![nfi.limit.0.clone()],
-                    vec![nfi.limit.1.clone()],
-                );
-                let step_assign = Assign::new(
-                    vec![nfi.step.0.clone()],
-                    vec![nfi.step.1.clone()],
-                );
+                let counter_assign =
+                    Assign::new(vec![nfi.counter.0.clone()], vec![nfi.counter.1.clone()]);
+                let limit_assign =
+                    Assign::new(vec![nfi.limit.0.clone()], vec![nfi.limit.1.clone()]);
+                let step_assign = Assign::new(vec![nfi.step.0.clone()], vec![nfi.step.1.clone()]);
 
                 // Replace NumForInit with assignments
                 block.0.remove(i);
@@ -63,15 +56,12 @@ pub fn cleanup_for_statements(block: &mut Block) {
             }
             Statement::GenericForInit(gfi) => {
                 // Convert GenericForInit to assignment: generator, state, control = exprs
-                let assign = Assign::new(
-                    gfi.0.left.clone(),
-                    gfi.0.right.clone(),
-                );
+                let assign = Assign::new(gfi.0.left.clone(), gfi.0.right.clone());
                 block.0.remove(i);
                 block.0.insert(i, assign.into());
                 i += 1;
             }
-            Statement::GenericForNext(gfn) => {
+            Statement::GenericForNext(_gfn) => {
                 // GenericForNext is more complex - the iterator call is implicit
                 // For now, convert to a comment indicating the structure
                 // This is a fallback that produces somewhat readable output

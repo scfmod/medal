@@ -15,6 +15,7 @@ const CONSTANT_CLOSURE: u8 = 6;
 const CONSTANT_VECTOR: u8 = 7;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum Constant {
     Nil,
     Boolean(bool),

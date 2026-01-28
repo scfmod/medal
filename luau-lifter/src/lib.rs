@@ -25,19 +25,9 @@ use lifter::Lifter;
 use clap::Parser;
 use parking_lot::Mutex;
 use petgraph::algo::dominators::simple_fast;
-use rayon::prelude::*;
 
-use anyhow::anyhow;
 use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
-use walkdir::WalkDir;
-
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::Path,
-    time::Instant,
-};
 
 use deserializer::bytecode::Bytecode;
 
@@ -71,7 +61,9 @@ pub fn dump_bytecode(bytecode: &[u8], encode_key: u8, func_name: Option<&str>) {
         Bytecode::Chunk(chunk) => {
             for (func_id, func) in chunk.functions.iter().enumerate() {
                 // Get function name from string table
-                let name = if func.function_name > 0 && func.function_name <= chunk.string_table.len() {
+                let name = if func.function_name > 0
+                    && func.function_name <= chunk.string_table.len()
+                {
                     String::from_utf8_lossy(&chunk.string_table[func.function_name - 1]).to_string()
                 } else {
                     format!("function_{}", func_id)
@@ -85,8 +77,10 @@ pub fn dump_bytecode(bytecode: &[u8], encode_key: u8, func_name: Option<&str>) {
                 }
 
                 println!("\n=== Function {} ({}) ===", func_id, name);
-                println!("Parameters: {}, Stack: {}, Upvalues: {}, Vararg: {}",
-                    func.num_parameters, func.max_stack_size, func.num_upvalues, func.is_vararg);
+                println!(
+                    "Parameters: {}, Stack: {}, Upvalues: {}, Vararg: {}",
+                    func.num_parameters, func.max_stack_size, func.num_upvalues, func.is_vararg
+                );
                 println!("Instructions:");
 
                 for (pc, insn) in func.instructions.iter().enumerate() {
@@ -101,12 +95,17 @@ pub fn dump_bytecode(bytecode: &[u8], encode_key: u8, func_name: Option<&str>) {
                 if !func.local_debug_info.is_empty() {
                     println!("\nLocal Debug Info:");
                     for info in &func.local_debug_info {
-                        let name = if info.name_index > 0 && info.name_index <= chunk.string_table.len() {
-                            String::from_utf8_lossy(&chunk.string_table[info.name_index - 1]).to_string()
-                        } else {
-                            "(no name)".to_string()
-                        };
-                        println!("  R{}: \"{}\" (PC {}-{})", info.register, name, info.scope_start, info.scope_end);
+                        let name =
+                            if info.name_index > 0 && info.name_index <= chunk.string_table.len() {
+                                String::from_utf8_lossy(&chunk.string_table[info.name_index - 1])
+                                    .to_string()
+                            } else {
+                                "(no name)".to_string()
+                            };
+                        println!(
+                            "  R{}: \"{}\" (PC {}-{})",
+                            info.register, name, info.scope_start, info.scope_end
+                        );
                     }
                 }
             }
@@ -138,7 +137,7 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
                         static BACKTRACE: RefCell<Option<Backtrace>> = const { RefCell::new(None) };
                     }
 
-                    let function_id = function.id;
+                    let _function_id = function.id;
                     let mut args = std::panic::AssertUnwindSafe(Some((
                         ast_function.clone(),
                         function,
@@ -153,7 +152,7 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
                     match result {
                         Ok(r) => r,
                         Err(e) => {
-                            let panic_information = match e.downcast::<String>() {
+                            let _panic_information = match e.downcast::<String>() {
                                 Ok(v) => *v,
                                 Err(e) => match e.downcast::<&str>() {
                                     Ok(v) => v.to_string(),
@@ -249,14 +248,14 @@ fn decompile_function(
 
         if structure_jumps(&mut function, &dominators) {
             changed = true;
-            dominators_valid = false;  // CFG changed, invalidate dominators
+            dominators_valid = false; // CFG changed, invalidate dominators
         }
 
         ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
         if structure_conditionals(&mut function) {
             changed = true;
-            dominators_valid = false;  // CFG changed, invalidate dominators
+            dominators_valid = false; // CFG changed, invalidate dominators
         }
 
         let mut local_map = FxHashMap::default();
@@ -288,10 +287,12 @@ fn decompile_function(
         // Check if this SSA version maps back to a parameter
         for param in &function.parameters {
             if ssa_version == param {
-                continue;  // Already in locals_to_ignore
+                continue; // Already in locals_to_ignore
             }
             // Check if they're in the same local group (meaning ssa_version is an SSA version of param)
-            if let (Some(&version_group), Some(&param_group)) = (local_to_group.get(ssa_version), local_to_group.get(param)) {
+            if let (Some(&version_group), Some(&param_group)) =
+                (local_to_group.get(ssa_version), local_to_group.get(param))
+            {
                 if version_group == param_group {
                     locals_to_ignore.insert(ssa_version.clone());
                 }

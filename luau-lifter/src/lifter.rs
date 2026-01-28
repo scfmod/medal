@@ -28,7 +28,7 @@ pub struct Lifter<'a> {
     blocks: FxHashMap<usize, NodeIndex>,
     function: Function,
     child_functions: FxHashMap<ByAddress<Arc<Mutex<ast::Function>>>, usize>,
-    register_map: FxHashMap<(usize, usize), ast::RcLocal>,  // (register, pc) -> local
+    register_map: FxHashMap<(usize, usize), ast::RcLocal>, // (register, pc) -> local
     constant_map: FxHashMap<usize, ast::Literal>,
     current_node: Option<NodeIndex>,
     current_pc: usize,
@@ -95,12 +95,16 @@ impl<'a> Lifter<'a> {
 
         for i in 0..self.function_list[self.function.id].num_upvalues {
             let bytecode_func = &self.function_list[self.function.id];
-            let upvalue = if let Some(&name_index) = bytecode_func.upvalue_debug_names.get(i as usize) {
-                if name_index > 0 {
-                    if let Some(name_bytes) = self.string_table.get(name_index - 1) {
-                        if let Ok(name) = String::from_utf8(name_bytes.clone()) {
-                            if !name.starts_with('(') {
-                                ast::RcLocal::new(ast::Local::new(Some(name)))
+            let upvalue =
+                if let Some(&name_index) = bytecode_func.upvalue_debug_names.get(i as usize) {
+                    if name_index > 0 {
+                        if let Some(name_bytes) = self.string_table.get(name_index - 1) {
+                            if let Ok(name) = String::from_utf8(name_bytes.clone()) {
+                                if !name.starts_with('(') {
+                                    ast::RcLocal::new(ast::Local::new(Some(name)))
+                                } else {
+                                    ast::RcLocal::default()
+                                }
                             } else {
                                 ast::RcLocal::default()
                             }
@@ -112,22 +116,23 @@ impl<'a> Lifter<'a> {
                     }
                 } else {
                     ast::RcLocal::default()
-                }
-            } else {
-                ast::RcLocal::default()
-            };
+                };
             self.upvalues.push(upvalue);
         }
 
         for i in 0..self.function_list[self.function.id].num_parameters {
             // Try to get debug name for parameter
             let bytecode_func = &self.function_list[self.function.id];
-            let parameter = if let Some(name_index) = bytecode_func.get_debug_name_for_register(i, 0) {
-                if name_index > 0 {
-                    if let Some(name_bytes) = self.string_table.get(name_index - 1) {
-                        if let Ok(name) = String::from_utf8(name_bytes.clone()) {
-                            if !name.starts_with('(') {
-                                ast::RcLocal::new(ast::Local::new(Some(name)))
+            let parameter =
+                if let Some(name_index) = bytecode_func.get_debug_name_for_register(i, 0) {
+                    if name_index > 0 {
+                        if let Some(name_bytes) = self.string_table.get(name_index - 1) {
+                            if let Ok(name) = String::from_utf8(name_bytes.clone()) {
+                                if !name.starts_with('(') {
+                                    ast::RcLocal::new(ast::Local::new(Some(name)))
+                                } else {
+                                    ast::RcLocal::default()
+                                }
                             } else {
                                 ast::RcLocal::default()
                             }
@@ -139,10 +144,7 @@ impl<'a> Lifter<'a> {
                     }
                 } else {
                     ast::RcLocal::default()
-                }
-            } else {
-                ast::RcLocal::default()
-            };
+                };
             self.function.parameters.push(parameter.clone());
             // Parameters have scope_start = 0
             self.register_map.insert((i as usize, 0), parameter);
@@ -171,10 +173,8 @@ impl<'a> Lifter<'a> {
                 if let Some(name_bytes) = self.string_table.get(info.name_index - 1) {
                     if let Ok(name) = String::from_utf8(name_bytes.clone()) {
                         if !name.starts_with('(') {
-                            self.register_map.insert(
-                                (index, 0),
-                                ast::RcLocal::new(ast::Local::new(Some(name))),
-                            );
+                            self.register_map
+                                .insert((index, 0), ast::RcLocal::new(ast::Local::new(Some(name))));
                         }
                     }
                 }
@@ -1356,7 +1356,7 @@ impl<'a> Lifter<'a> {
                     }
                     _ => unreachable!("{:?}", instruction),
                 },
-                _ => unimplemented!("{:?}", instruction),
+                //_ => unimplemented!("{:?}", instruction),
             }
         }
 
@@ -1386,12 +1386,12 @@ impl<'a> Lifter<'a> {
         let bytecode_func = &self.function_list[self.function.id];
         let pc = self.current_pc;
 
-
         self.register_map
-            .entry((index, 0))  // Use simple key - scope tracking breaks CFG lifting
+            .entry((index, 0)) // Use simple key - scope tracking breaks CFG lifting
             .or_insert_with(|| {
                 // Try to get the debug name for this register from bytecode debug info
-                if let Some(name_index) = bytecode_func.get_debug_name_for_register(index as u8, pc) {
+                if let Some(name_index) = bytecode_func.get_debug_name_for_register(index as u8, pc)
+                {
                     // name_index is 1-based (0 means no name)
                     if name_index > 0 {
                         if let Some(name_bytes) = self.string_table.get(name_index - 1) {

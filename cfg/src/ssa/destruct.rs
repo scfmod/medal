@@ -4,11 +4,11 @@ use ast::{LocalRw, RcLocal};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use petgraph::{
+    Direction,
     algo::dominators::simple_fast,
     prelude::DiGraphMap,
     stable_graph::NodeIndex,
     visit::{Dfs, DfsPostOrder, EdgeRef},
-    Direction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -111,17 +111,17 @@ impl<'a> Destructor<'a> {
         self.sequentialize();
     }
 
-    fn add_liveness_comments(&mut self) {
-        for node in self.function.graph().node_indices().collect::<Vec<_>>() {
-            let liveness = &self.liveness[&node];
-            let block = self.function.block_mut(node).unwrap();
-            block.insert(
-                0,
-                ast::Comment::new(liveness.live_in.iter().join(", ")).into(),
-            );
-            block.push(ast::Comment::new(liveness.live_out.iter().join(", ")).into());
-        }
-    }
+    // fn add_liveness_comments(&mut self) {
+    //     for node in self.function.graph().node_indices().collect::<Vec<_>>() {
+    //         let liveness = &self.liveness[&node];
+    //         let block = self.function.block_mut(node).unwrap();
+    //         block.insert(
+    //             0,
+    //             ast::Comment::new(liveness.live_in.iter().join(", ")).into(),
+    //         );
+    //         block.push(ast::Comment::new(liveness.live_out.iter().join(", ")).into());
+    //     }
+    // }
 
     fn coalesce_upvalues(&mut self) {
         for (upvalue, group) in self
@@ -289,10 +289,12 @@ impl<'a> Destructor<'a> {
         while let Some(node) = dominator_dfs.next(self.function.graph()) {
             if node == self.function.entry().unwrap() {
                 assert!(dominator_index == 0);
-                assert!(!self
-                    .function
-                    .edges_to_block(node)
-                    .any(|(_, e)| !e.arguments.is_empty()));
+                assert!(
+                    !self
+                        .function
+                        .edges_to_block(node)
+                        .any(|(_, e)| !e.arguments.is_empty())
+                );
                 for (i, local) in self
                     .upvalues_in
                     .iter()
@@ -468,7 +470,11 @@ impl<'a> Destructor<'a> {
                     }
                     ast::Statement::GenericForInit(gfi) => {
                         is_assign = false;
-                        pairs_to_coalesce = gfi.0.left.iter().zip(gfi.0.right.iter())
+                        pairs_to_coalesce = gfi
+                            .0
+                            .left
+                            .iter()
+                            .zip(gfi.0.right.iter())
                             .filter_map(|(left, right)| {
                                 let left_local = left.as_local()?.clone();
                                 let right_local = right.as_local()?.clone();
@@ -560,7 +566,7 @@ impl<'a> Destructor<'a> {
             // and false if there's NO interference (success, and it merges the classes)
             // We need to return true on success, false on failure
             let has_interference = self.check_interfere_single(&left_con_class, &right_con_class);
-            !has_interference  // Invert: return true on success
+            !has_interference // Invert: return true on success
         } else if !self.check_interfere(&left_con_class, &right_con_class) {
             self.merge_congruence_classes(&left_con_class, &right_con_class);
             true
@@ -629,15 +635,20 @@ impl<'a> Destructor<'a> {
             true
         } else {
             // Merge both locals into target_class
-            self.equal_ancestor_in.insert(local_a.clone(), local_b.clone());
+            self.equal_ancestor_in
+                .insert(local_a.clone(), local_b.clone());
             let (dom_index_a, _, stat_index_a) = self.local_defs[&local_a];
             let (dom_index_b, _, stat_index_b) = self.local_defs[&local_b];
-            target_class.borrow_mut()
+            target_class
+                .borrow_mut()
                 .insert((dom_index_a, stat_index_a), local_a.clone());
-            target_class.borrow_mut()
+            target_class
+                .borrow_mut()
                 .insert((dom_index_b, stat_index_b), local_b.clone());
-            self.congruence_classes.insert(local_a, target_class.clone());
-            self.congruence_classes.insert(local_b, target_class.clone());
+            self.congruence_classes
+                .insert(local_a, target_class.clone());
+            self.congruence_classes
+                .insert(local_b, target_class.clone());
             false
         }
     }
@@ -828,9 +839,9 @@ impl<'a> Destructor<'a> {
             }
             for stat_index in 0..self.function.block_mut(node).unwrap().0.len() {
                 // Collect (left, right) pairs to add to value classes
-                let pairs: Vec<(RcLocal, RcLocal)> = match &self.function.block(node).unwrap()[stat_index] {
-                    ast::Statement::Assign(assign) => {
-                        assign
+                let pairs: Vec<(RcLocal, RcLocal)> =
+                    match &self.function.block(node).unwrap()[stat_index] {
+                        ast::Statement::Assign(assign) => assign
                             .left
                             .iter()
                             .enumerate()
@@ -839,47 +850,48 @@ impl<'a> Destructor<'a> {
                                 let right = assign.right.get(i)?.as_local()?.clone();
                                 Some((left, right))
                             })
-                            .collect()
-                    }
-                    ast::Statement::NumForInit(nfi) => {
-                        // NumForInit has counter, limit, step pairs that should be in same value class
-                        [&nfi.counter, &nfi.limit, &nfi.step]
-                            .iter()
-                            .filter_map(|pair| {
-                                let left = pair.0.as_local()?.clone();
-                                let right = pair.1.as_local()?.clone();
-                                Some((left, right))
-                            })
-                            .collect()
-                    }
-                    ast::Statement::NumForNext(nfn) => {
-                        // NumForNext has counter pair
-                        std::iter::once(&nfn.counter)
-                            .filter_map(|pair| {
-                                let left = pair.0.as_local()?.clone();
-                                let right = pair.1.as_local()?.clone();
-                                Some((left, right))
-                            })
-                            .collect()
-                    }
-                    ast::Statement::GenericForInit(gfi) => {
-                        // GenericForInit has left/right pairs like an Assign
-                        gfi.0.left.iter().zip(gfi.0.right.iter())
-                            .filter_map(|(l, r)| {
-                                let left = l.as_local()?.clone();
-                                let right = r.as_local()?.clone();
-                                Some((left, right))
-                            })
-                            .collect()
-                    }
-                    _ => Vec::new(),
-                };
+                            .collect(),
+                        ast::Statement::NumForInit(nfi) => {
+                            // NumForInit has counter, limit, step pairs that should be in same value class
+                            [&nfi.counter, &nfi.limit, &nfi.step]
+                                .iter()
+                                .filter_map(|pair| {
+                                    let left = pair.0.as_local()?.clone();
+                                    let right = pair.1.as_local()?.clone();
+                                    Some((left, right))
+                                })
+                                .collect()
+                        }
+                        ast::Statement::NumForNext(nfn) => {
+                            // NumForNext has counter pair
+                            std::iter::once(&nfn.counter)
+                                .filter_map(|pair| {
+                                    let left = pair.0.as_local()?.clone();
+                                    let right = pair.1.as_local()?.clone();
+                                    Some((left, right))
+                                })
+                                .collect()
+                        }
+                        ast::Statement::GenericForInit(gfi) => {
+                            // GenericForInit has left/right pairs like an Assign
+                            gfi.0
+                                .left
+                                .iter()
+                                .zip(gfi.0.right.iter())
+                                .filter_map(|(l, r)| {
+                                    let left = l.as_local()?.clone();
+                                    let right = r.as_local()?.clone();
+                                    Some((left, right))
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
 
                 for (left, right) in pairs {
                     let value_class = self.get_value_class(right.clone()).clone();
                     value_class.borrow_mut().insert(left.clone());
-                    let prev_val_class =
-                        self.values.insert(left.clone(), value_class.clone());
+                    let prev_val_class = self.values.insert(left.clone(), value_class.clone());
                     if let Some(prev_val_class) = prev_val_class {
                         // merge value classes
                         let prev_val_class = prev_val_class.take();

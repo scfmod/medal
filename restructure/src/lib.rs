@@ -1,11 +1,9 @@
-#![feature(let_chains)]
-
 use cfg::{block::BranchType, function::Function};
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use petgraph::{
-    algo::dominators::{simple_fast, Dominators},
+    algo::dominators::{Dominators, simple_fast},
     stable_graph::{EdgeIndex, NodeIndex, StableDiGraph},
     visit::*,
 };

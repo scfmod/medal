@@ -1,7 +1,4 @@
-use core::num;
-
 use nom::{
-    complete::take,
     number::complete::{le_u32, le_u8},
     IResult,
 };
@@ -24,6 +21,7 @@ pub struct LocalDebugInfo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Function {
     pub max_stack_size: u8,
     pub num_parameters: u8,
@@ -158,8 +156,6 @@ impl Function {
                 (input, Some(line_info_delta))
             }
         };
-
-        let mut last_line: usize = 0;
 
         let (input, abs_line_info_delta, last_line) = match &line_info_delta {
             None => (input, None, 0),

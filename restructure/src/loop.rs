@@ -65,27 +65,17 @@ impl GraphStructurer {
                 init_block_ast.0.remove(init_index);
                 init_block_ast.0.insert(
                     init_index,
-                    ast::Assign::new(
-                        vec![ast::LValue::Local(counter_local)],
-                        vec![counter_init],
-                    )
-                    .into(),
+                    ast::Assign::new(vec![ast::LValue::Local(counter_local)], vec![counter_init])
+                        .into(),
                 );
                 init_block_ast.0.insert(
                     init_index + 1,
-                    ast::Assign::new(
-                        vec![ast::LValue::Local(limit_local)],
-                        vec![limit_init],
-                    )
-                    .into(),
+                    ast::Assign::new(vec![ast::LValue::Local(limit_local)], vec![limit_init])
+                        .into(),
                 );
                 init_block_ast.0.insert(
                     init_index + 2,
-                    ast::Assign::new(
-                        vec![ast::LValue::Local(step_local)],
-                        vec![step_init],
-                    )
-                    .into(),
+                    ast::Assign::new(vec![ast::LValue::Local(step_local)], vec![step_init]).into(),
                 );
             }
         }
@@ -116,12 +106,7 @@ impl GraphStructurer {
                 // Create counter increment: counter = counter + step
                 let increment = ast::Assign::new(
                     vec![ast::LValue::Local(counter_local.clone())],
-                    vec![ast::Binary::new(
-                        counter_rvalue,
-                        step,
-                        ast::BinaryOperation::Add,
-                    )
-                    .into()],
+                    vec![ast::Binary::new(counter_rvalue, step, ast::BinaryOperation::Add).into()],
                 );
 
                 header_block.0.remove(idx);
@@ -185,7 +170,7 @@ impl GraphStructurer {
                 let then_successors = self.function.successor_blocks(then_node).collect_vec();
 
                 let can_structure_for_loop = then_successors.len() <= 1 && {
-                    let (init_block, init_index) = self.find_for_init(header);
+                    let (init_block, _init_index) = self.find_for_init(header);
                     let structure_ok = if then_node != else_node {
                         self.function.predecessor_blocks(then_node).count() == 1
                     } else {
@@ -194,9 +179,11 @@ impl GraphStructurer {
                     if !structure_ok || then_successors.is_empty() {
                         false
                     } else {
-                        let else_successors = self.function.successor_blocks(else_node).collect_vec();
+                        let else_successors =
+                            self.function.successor_blocks(else_node).collect_vec();
                         (then_successors[0] == else_node)
-                            || (else_successors.len() == 1 && then_successors[0] == else_successors[0])
+                            || (else_successors.len() == 1
+                                && then_successors[0] == else_successors[0])
                             || (then_successors[0] == header && else_node == init_block)
                     }
                 };
@@ -291,11 +278,14 @@ impl GraphStructurer {
                     };
                     let header_block = self.function.block_mut(header).unwrap();
                     *header_block = if header_block.is_empty() {
-                        vec![ast::While::new(
-                            ast::Unary::new(condition, ast::UnaryOperation::Not).reduce_condition(),
-                            header_block.clone(),
-                        )
-                        .into()]
+                        vec![
+                            ast::While::new(
+                                ast::Unary::new(condition, ast::UnaryOperation::Not)
+                                    .reduce_condition(),
+                                header_block.clone(),
+                            )
+                            .into(),
+                        ]
                         .into()
                     } else {
                         vec![ast::Repeat::new(condition, header_block.clone()).into()].into()
@@ -307,11 +297,10 @@ impl GraphStructurer {
                     self.match_jump(header, Some(next));
                 } else {
                     let header_block = self.function.block_mut(header).unwrap();
-                    *header_block = vec![ast::While::new(
-                        ast::Literal::Boolean(true).into(),
-                        header_block.clone(),
-                    )
-                    .into()]
+                    *header_block = vec![
+                        ast::While::new(ast::Literal::Boolean(true).into(), header_block.clone())
+                            .into(),
+                    ]
                     .into();
                     self.function.remove_edges(header);
                     self.match_jump(header, None);

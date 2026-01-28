@@ -1,12 +1,7 @@
 use ast::SideEffects;
 use cfg::block::{BlockEdge, BranchType};
 use itertools::Itertools;
-use petgraph::{
-    algo::dominators::Dominators,
-    stable_graph::NodeIndex,
-    visit::{EdgeRef, IntoEdgeReferences},
-    Direction,
-};
+use petgraph::{Direction, stable_graph::NodeIndex, visit::EdgeRef};
 
 impl super::GraphStructurer {
     // TODO: STYLE: better name

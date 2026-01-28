@@ -2,10 +2,10 @@ use ast::{LocalRw, Reduce, SideEffects, Traverse, UnaryOperation};
 
 use itertools::Itertools;
 use petgraph::{
+    Direction,
     algo::dominators::Dominators,
     stable_graph::{EdgeIndex, NodeIndex},
     visit::{DfsPostOrder, EdgeRef},
-    Direction,
 };
 use rustc_hash::FxHashMap;
 use tuple::Map;
@@ -31,6 +31,7 @@ impl From<PatternOperator> for ast::BinaryOperation {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ConditionalAssignmentPattern {
     assigner: NodeIndex,
     next: NodeIndex,
@@ -40,8 +41,6 @@ pub struct ConditionalAssignmentPattern {
     parameter: ast::RcLocal,
     operator: PatternOperator,
 }
-
-type ConditionalSequenceConfiguration = (bool, bool);
 
 #[derive(Debug)]
 pub struct ConditionalSequencePattern {
@@ -54,6 +53,7 @@ pub struct ConditionalSequencePattern {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct GenericForNextPattern {
     body_node: NodeIndex,
     res_locals: Vec<ast::RcLocal>,

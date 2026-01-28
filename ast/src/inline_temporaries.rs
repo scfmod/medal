@@ -45,7 +45,12 @@ struct Inliner {
 impl Inliner {
     /// `protected_locals` contains locals from outer scopes that should never be inlined
     /// (e.g., variables used in outer while/repeat conditions)
-    fn inline_block(&mut self, block: &mut Block, depth: usize, protected_locals: &FxHashSet<RcLocal>) {
+    fn inline_block(
+        &mut self,
+        block: &mut Block,
+        depth: usize,
+        protected_locals: &FxHashSet<RcLocal>,
+    ) {
         if depth > MAX_DEPTH {
             return;
         }
@@ -86,7 +91,9 @@ impl Inliner {
             if let Some((local, rvalue)) = self.extract_inline_candidate(&block[i]) {
                 // Use name-based comparison for SSA versions
                 let is_candidate = inline_candidates.contains(&local)
-                    || inline_candidates.iter().any(|c| c.name().is_some() && c.name() == local.name());
+                    || inline_candidates
+                        .iter()
+                        .any(|c| c.name().is_some() && c.name() == local.name());
 
                 if is_candidate {
                     if has_side_effects(&rvalue) {
@@ -95,7 +102,9 @@ impl Inliner {
                         // 1. The next statement(s) don't have side effects (they're just local assignments)
                         // 2. We find a statement that uses this local exactly once
                         // 3. No intervening statement writes to any local we read
-                        if let Some(_use_idx) = self.find_safe_inline_target(&local, &rvalue, block, i) {
+                        if let Some(_use_idx) =
+                            self.find_safe_inline_target(&local, &rvalue, block, i)
+                        {
                             // Store for later inlining when we reach the target statement
                             self.immediate_inlines.insert(local.clone(), rvalue);
                             block.0.remove(i);
@@ -214,12 +223,18 @@ impl Inliner {
             // Check if statement i is an assignment with iterator call
             let (is_iterator_assign, assign_locals) = if let Statement::Assign(assign) = &block[i] {
                 let is_iterator_call = assign.right.len() == 1
-                    && matches!(&assign.right[0],
-                        RValue::Call(_) | RValue::Select(Select::Call(_)) |
-                        RValue::MethodCall(_) | RValue::Select(Select::MethodCall(_)));
+                    && matches!(
+                        &assign.right[0],
+                        RValue::Call(_)
+                            | RValue::Select(Select::Call(_))
+                            | RValue::MethodCall(_)
+                            | RValue::Select(Select::MethodCall(_))
+                    );
                 if is_iterator_call && assign.left.len() >= 1 {
                     // Collect the local names being assigned
-                    let locals: Vec<_> = assign.left.iter()
+                    let locals: Vec<_> = assign
+                        .left
+                        .iter()
                         .filter_map(|lv| lv.as_local())
                         .filter_map(|l| l.name())
                         .collect();
@@ -246,13 +261,15 @@ impl Inliner {
                 if let Statement::GenericFor(generic_for) = &block[j] {
                     // Check if this for-loop uses exactly our assigned locals
                     if generic_for.right.len() == assign_locals.len() {
-                        let matches = generic_for.right.iter().zip(&assign_locals).all(|(rv, expected_name)| {
-                            if let RValue::Local(for_local) = rv {
-                                for_local.name().as_ref() == Some(expected_name)
-                            } else {
-                                false
-                            }
-                        });
+                        let matches = generic_for.right.iter().zip(&assign_locals).all(
+                            |(rv, expected_name)| {
+                                if let RValue::Local(for_local) = rv {
+                                    for_local.name().as_ref() == Some(expected_name)
+                                } else {
+                                    false
+                                }
+                            },
+                        );
                         if matches {
                             for_idx = Some(j);
                             break;
@@ -263,9 +280,9 @@ impl Inliner {
                 // Only allow simple local assignments that don't reference our iterator locals
                 if let Statement::Assign(intervening) = &block[j] {
                     let reads_our_locals = intervening.right.iter().any(|rv| {
-                        rv.values_read().iter().any(|l| {
-                            assign_locals.iter().any(|n| l.name().as_ref() == Some(n))
-                        })
+                        rv.values_read()
+                            .iter()
+                            .any(|l| assign_locals.iter().any(|n| l.name().as_ref() == Some(n)))
                     });
                     if reads_our_locals {
                         break; // Can't move past this
@@ -304,27 +321,38 @@ impl Inliner {
         let mut i = 0;
         while i + 1 < block.len() {
             // Check if statement i is an assignment and i+1 is a GenericFor
-            let can_inline = if let (
-                Statement::Assign(assign),
-                Statement::GenericFor(generic_for),
-            ) = (&block[i], &block[i + 1])
-            {
-                // The assignment must have a call as its RHS (like pairs() or ipairs())
-                let is_iterator_call = assign.right.len() == 1
-                    && matches!(&assign.right[0],
-                        RValue::Call(_) | RValue::Select(Select::Call(_)) |
-                        RValue::MethodCall(_) | RValue::Select(Select::MethodCall(_)));
+            let can_inline =
+                if let (Statement::Assign(assign), Statement::GenericFor(generic_for)) =
+                    (&block[i], &block[i + 1])
+                {
+                    // The assignment must have a call as its RHS (like pairs() or ipairs())
+                    let is_iterator_call = assign.right.len() == 1
+                        && matches!(
+                            &assign.right[0],
+                            RValue::Call(_)
+                                | RValue::Select(Select::Call(_))
+                                | RValue::MethodCall(_)
+                                | RValue::Select(Select::MethodCall(_))
+                        );
 
-                if is_iterator_call && assign.left.len() >= 1 && generic_for.right.len() == assign.left.len() {
-                    // Check that all for-loop iterators are locals matching the assignment
-                    let mut matches = true;
-                    for (j, rv) in generic_for.right.iter().enumerate() {
-                        if let RValue::Local(for_local) = rv {
-                            if let LValue::Local(assign_local) = &assign.left[j] {
-                                // Compare by identity OR by name for SSA versions
-                                let same = for_local == assign_local
-                                    || (for_local.name().is_some() && for_local.name() == assign_local.name());
-                                if !same {
+                    if is_iterator_call
+                        && assign.left.len() >= 1
+                        && generic_for.right.len() == assign.left.len()
+                    {
+                        // Check that all for-loop iterators are locals matching the assignment
+                        let mut matches = true;
+                        for (j, rv) in generic_for.right.iter().enumerate() {
+                            if let RValue::Local(for_local) = rv {
+                                if let LValue::Local(assign_local) = &assign.left[j] {
+                                    // Compare by identity OR by name for SSA versions
+                                    let same = for_local == assign_local
+                                        || (for_local.name().is_some()
+                                            && for_local.name() == assign_local.name());
+                                    if !same {
+                                        matches = false;
+                                        break;
+                                    }
+                                } else {
                                     matches = false;
                                     break;
                                 }
@@ -332,18 +360,14 @@ impl Inliner {
                                 matches = false;
                                 break;
                             }
-                        } else {
-                            matches = false;
-                            break;
                         }
+                        matches
+                    } else {
+                        false
                     }
-                    matches
                 } else {
                     false
-                }
-            } else {
-                false
-            };
+                };
 
             if can_inline {
                 // Extract the RHS from the assignment
@@ -411,9 +435,21 @@ impl Inliner {
             };
 
             // Collect locals used in the for-loop header
-            let initial_local = if let RValue::Local(l) = &numeric_for.initial { Some(l.clone()) } else { None };
-            let limit_local = if let RValue::Local(l) = &numeric_for.limit { Some(l.clone()) } else { None };
-            let step_local = if let RValue::Local(l) = &numeric_for.step { Some(l.clone()) } else { None };
+            let initial_local = if let RValue::Local(l) = &numeric_for.initial {
+                Some(l.clone())
+            } else {
+                None
+            };
+            let limit_local = if let RValue::Local(l) = &numeric_for.limit {
+                Some(l.clone())
+            } else {
+                None
+            };
+            let step_local = if let RValue::Local(l) = &numeric_for.step {
+                Some(l.clone())
+            } else {
+                None
+            };
 
             // Search backwards for assignments that can be inlined
             let mut assign_idx = for_idx;
@@ -434,12 +470,16 @@ impl Inliner {
 
                 // Check if this assignment is to a local used in the for-loop header
                 let same_local_or_name = |l: &RcLocal| {
-                    l == assign_local ||
-                    (assign_local.name().is_some() && l.name() == assign_local.name())
+                    l == assign_local
+                        || (assign_local.name().is_some() && l.name() == assign_local.name())
                 };
 
-                let matches_initial = initial_local.as_ref().map_or(false, |l| same_local_or_name(l));
-                let matches_limit = limit_local.as_ref().map_or(false, |l| same_local_or_name(l));
+                let matches_initial = initial_local
+                    .as_ref()
+                    .map_or(false, |l| same_local_or_name(l));
+                let matches_limit = limit_local
+                    .as_ref()
+                    .map_or(false, |l| same_local_or_name(l));
                 let matches_step = step_local.as_ref().map_or(false, |l| same_local_or_name(l));
 
                 // Count how many places this local is used in the for header
@@ -455,7 +495,8 @@ impl Inliner {
                 // Only inline if the ASSIGNED local is an unnamed temporary
                 // We don't want to inline named locals (like minX) because that would
                 // replace good names with temporaries (backwards from what we want)
-                let is_unnamed = assign_local.name()
+                let is_unnamed = assign_local
+                    .name()
                     .map_or(true, |n| is_unnamed_temporary(&n));
 
                 if !is_unnamed {
@@ -497,7 +538,11 @@ impl Inliner {
     /// to calls are NOT inlined since the original code likely wanted that variable.
     ///
     /// `protected_locals` contains locals from outer scopes that should never be inlined
-    fn find_inline_candidates(&self, block: &Block, protected_locals: &FxHashSet<RcLocal>) -> FxHashSet<RcLocal> {
+    fn find_inline_candidates(
+        &self,
+        block: &Block,
+        protected_locals: &FxHashSet<RcLocal>,
+    ) -> FxHashSet<RcLocal> {
         // Track (local, rvalue) for definitions
         let mut definitions: FxHashMap<RcLocal, (usize, Option<&RValue>)> = FxHashMap::default();
         // Track uses at the current block level (not inside nested blocks)
@@ -551,18 +596,30 @@ impl Inliner {
                     Self::collect_reads_in_block_set(&i.else_block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&i.then_block.lock(), &mut nested_block_writes);
                     Self::collect_writes_in_block(&i.else_block.lock(), &mut nested_block_writes);
-                    Self::collect_upvalue_captures_in_block(&i.then_block.lock(), &mut upvalue_captured);
-                    Self::collect_upvalue_captures_in_block(&i.else_block.lock(), &mut upvalue_captured);
+                    Self::collect_upvalue_captures_in_block(
+                        &i.then_block.lock(),
+                        &mut upvalue_captured,
+                    );
+                    Self::collect_upvalue_captures_in_block(
+                        &i.else_block.lock(),
+                        &mut upvalue_captured,
+                    );
                 }
                 Statement::NumericFor(nf) => {
                     Self::collect_reads_in_block_set(&nf.block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&nf.block.lock(), &mut nested_block_writes);
-                    Self::collect_upvalue_captures_in_block(&nf.block.lock(), &mut upvalue_captured);
+                    Self::collect_upvalue_captures_in_block(
+                        &nf.block.lock(),
+                        &mut upvalue_captured,
+                    );
                 }
                 Statement::GenericFor(gf) => {
                     Self::collect_reads_in_block_set(&gf.block.lock(), &mut nested_block_reads);
                     Self::collect_writes_in_block(&gf.block.lock(), &mut nested_block_writes);
-                    Self::collect_upvalue_captures_in_block(&gf.block.lock(), &mut upvalue_captured);
+                    Self::collect_upvalue_captures_in_block(
+                        &gf.block.lock(),
+                        &mut upvalue_captured,
+                    );
                 }
                 _ => {}
             }
@@ -598,18 +655,24 @@ impl Inliner {
             .into_iter()
             .filter(|(local, (def_count, rvalue))| {
                 // Use name-based lookup for current_level_uses to handle SSA versions
-                let current_uses = current_level_uses.get(local).copied()
+                let current_uses = current_level_uses
+                    .get(local)
+                    .copied()
                     .or_else(|| {
                         local.name().and_then(|name| {
-                            current_level_uses.iter()
+                            current_level_uses
+                                .iter()
                                 .find(|(l, _)| l.name().as_ref() == Some(&name))
                                 .map(|(_, &count)| count)
                         })
                     })
                     .unwrap_or(0);
                 // Check if local is read in nested blocks (by identity or by name for SSA versions)
-                let nested_uses = if nested_block_reads.contains(local) ||
-                    nested_block_reads.iter().any(|l| l.name().is_some() && l.name() == local.name()) {
+                let nested_uses = if nested_block_reads.contains(local)
+                    || nested_block_reads
+                        .iter()
+                        .any(|l| l.name().is_some() && l.name() == local.name())
+                {
                     1
                 } else {
                     0
@@ -633,16 +696,22 @@ impl Inliner {
                 // Never inline locals that are WRITTEN in nested blocks (if/while/for bodies)
                 // because the value changes inside the nested block
                 // Check by identity or by name for SSA versions
-                if nested_block_writes.contains(local) ||
-                    nested_block_writes.iter().any(|l| l.name().is_some() && l.name() == local.name()) {
+                if nested_block_writes.contains(local)
+                    || nested_block_writes
+                        .iter()
+                        .any(|l| l.name().is_some() && l.name() == local.name())
+                {
                     return false;
                 }
 
                 // Never inline locals that are captured as upvalues by closures
                 // Closures need the actual local reference, not just an inlined value
                 // Check by identity or by name for SSA versions
-                if upvalue_captured.contains(local) ||
-                    upvalue_captured.iter().any(|l| l.name().is_some() && l.name() == local.name()) {
+                if upvalue_captured.contains(local)
+                    || upvalue_captured
+                        .iter()
+                        .any(|l| l.name().is_some() && l.name() == local.name())
+                {
                     return false;
                 }
 
@@ -755,7 +824,10 @@ impl Inliner {
     /// Subtract upvalue captures from use counts. Closures capture a reference
     /// to a local, not its value, so these shouldn't be counted as "uses" for
     /// inlining purposes.
-    fn subtract_closure_upvalue_counts(rvalue: &RValue, current_level_uses: &mut FxHashMap<RcLocal, usize>) {
+    fn subtract_closure_upvalue_counts(
+        rvalue: &RValue,
+        current_level_uses: &mut FxHashMap<RcLocal, usize>,
+    ) {
         if let RValue::Closure(closure) = rvalue {
             for upvalue in &closure.upvalues {
                 let local = match upvalue {
@@ -903,8 +975,10 @@ impl Inliner {
             // A statement conflicts if it writes to a local that our RValue reads
             let writes = statement.values_written();
             let conflicts = writes.iter().any(|w| {
-                rvalue_reads.contains(*w) ||
-                rvalue_reads.iter().any(|r| r.name().is_some() && r.name() == w.name())
+                rvalue_reads.contains(*w)
+                    || rvalue_reads
+                        .iter()
+                        .any(|r| r.name().is_some() && r.name() == w.name())
             });
 
             if conflicts {
@@ -930,9 +1004,10 @@ impl Inliner {
     fn is_single_use(&self, local: &RcLocal, statement: &Statement) -> bool {
         let reads = statement.values_read();
         // Compare by identity OR by name for SSA versions
-        let count = reads.iter().filter(|l| {
-            **l == local || (l.name().is_some() && l.name() == local.name())
-        }).count();
+        let count = reads
+            .iter()
+            .filter(|l| **l == local || (l.name().is_some() && l.name() == local.name()))
+            .count();
         count == 1
     }
 
@@ -999,14 +1074,16 @@ impl Inliner {
         for local in reads {
             // Check if this local is a candidate - use name-based comparison for SSA versions
             let is_candidate = candidates.contains(local)
-                || candidates.iter().any(|c| c.name().is_some() && c.name() == local.name());
+                || candidates
+                    .iter()
+                    .any(|c| c.name().is_some() && c.name() == local.name());
 
             if is_candidate {
                 // Look up in deferred_inlines using name-based matching for SSA versions
                 let mut found_key = None;
                 for (key, _) in self.deferred_inlines.iter() {
-                    let matches = key == local
-                        || (key.name().is_some() && key.name() == local.name());
+                    let matches =
+                        key == local || (key.name().is_some() && key.name() == local.name());
                     if matches {
                         found_key = Some(key.clone());
                         break;
@@ -1062,12 +1139,7 @@ impl Inliner {
                 }
             }
 
-            work.extend(
-                rvalue
-                    .rvalues_mut()
-                    .into_iter()
-                    .map(|r| r as *mut RValue),
-            );
+            work.extend(rvalue.rvalues_mut().into_iter().map(|r| r as *mut RValue));
         }
     }
 
@@ -1129,8 +1201,7 @@ impl Inliner {
             // Look up in deferred_inlines using name-based matching for SSA versions
             let mut found_key = None;
             for (key, _) in self.deferred_inlines.iter() {
-                let matches = key == local
-                    || (key.name().is_some() && key.name() == local.name());
+                let matches = key == local || (key.name().is_some() && key.name() == local.name());
                 if matches {
                     found_key = Some(key.clone());
                     break;
@@ -1183,7 +1254,12 @@ impl Inliner {
 
     /// Recurse into nested blocks and closures within a statement
     /// `protected_locals` contains locals from outer scopes that should never be inlined
-    fn recurse_into_statement(&mut self, statement: &mut Statement, depth: usize, protected_locals: &FxHashSet<RcLocal>) {
+    fn recurse_into_statement(
+        &mut self,
+        statement: &mut Statement,
+        depth: usize,
+        protected_locals: &FxHashSet<RcLocal>,
+    ) {
         match statement {
             Statement::If(r#if) => {
                 self.inline_block(&mut r#if.then_block.lock(), depth + 1, protected_locals);
@@ -1218,7 +1294,12 @@ impl Inliner {
     }
 
     /// Find closures in rvalues using iterative traversal
-    fn find_and_process_closures(&mut self, statement: &mut Statement, depth: usize, protected_locals: &FxHashSet<RcLocal>) {
+    fn find_and_process_closures(
+        &mut self,
+        statement: &mut Statement,
+        depth: usize,
+        _protected_locals: &FxHashSet<RcLocal>,
+    ) {
         let mut closures = Vec::new();
         let mut work: Vec<*mut RValue> = statement
             .rvalues_mut()
@@ -1232,12 +1313,7 @@ impl Inliner {
             if let RValue::Closure(closure) = rvalue {
                 closures.push(closure.function.clone());
             } else {
-                work.extend(
-                    rvalue
-                        .rvalues_mut()
-                        .into_iter()
-                        .map(|r| r as *mut RValue),
-                );
+                work.extend(rvalue.rvalues_mut().into_iter().map(|r| r as *mut RValue));
             }
         }
 
@@ -1276,9 +1352,10 @@ fn has_side_effects(rvalue: &RValue) -> bool {
         RValue::Select(_) => true, // Select wraps calls
         RValue::Unary(unary) => has_side_effects(&unary.value),
         RValue::Binary(binary) => has_side_effects(&binary.left) || has_side_effects(&binary.right),
-        RValue::Table(table) => table.0.iter().any(|(k, v)| {
-            k.as_ref().map_or(false, has_side_effects) || has_side_effects(v)
-        }),
+        RValue::Table(table) => table
+            .0
+            .iter()
+            .any(|(k, v)| k.as_ref().map_or(false, has_side_effects) || has_side_effects(v)),
         // Index could theoretically call __index, but we treat it as side-effect-free
         // for practical decompilation purposes
         RValue::Index(index) => has_side_effects(&index.left) || has_side_effects(&index.right),
@@ -1364,8 +1441,8 @@ fn is_empty_declaration_for(statement: &Statement, target_local: &RcLocal) -> bo
         if assign.prefix && assign.right.is_empty() && assign.left.len() == 1 {
             if let Some(local) = assign.left[0].as_local() {
                 // Compare by identity or by name for SSA versions
-                return local == target_local ||
-                    (local.name().is_some() && local.name() == target_local.name());
+                return local == target_local
+                    || (local.name().is_some() && local.name() == target_local.name());
             }
         }
     }
@@ -1414,8 +1491,8 @@ fn extract_boolean_ternary(if_stat: &If) -> Option<(RcLocal, RValue)> {
     let else_local = else_assign.left[0].as_local()?;
 
     // Must be assigning to the same local (compare by identity or by name for SSA versions)
-    let same_local = then_local == else_local ||
-        (then_local.name().is_some() && then_local.name() == else_local.name());
+    let same_local = then_local == else_local
+        || (then_local.name().is_some() && then_local.name() == else_local.name());
     if !same_local {
         return None;
     }
@@ -1835,7 +1912,9 @@ fn simplify_and_chains(block: &mut Block) {
         // Becomes: v = cond1 and cond2 and finalExpr
         if matches!(initial_value, RValue::Literal(Literal::Boolean(false))) {
             if i + 1 < block.len() {
-                if let Some((conditions, final_expr)) = extract_nested_and_chain(&block[i + 1], &local) {
+                if let Some((conditions, final_expr)) =
+                    extract_nested_and_chain(&block[i + 1], &local)
+                {
                     if !conditions.is_empty() {
                         // Build: cond1 and cond2 and ... and finalExpr
                         let mut combined = conditions[0].clone();
@@ -1880,7 +1959,9 @@ fn simplify_and_chains(block: &mut Block) {
         // This handles patterns where the initial value is not just `false` but an expression
         if !matches!(initial_value, RValue::Literal(Literal::Boolean(false))) {
             if i + 1 < block.len() {
-                if let Some((conditions, final_expr)) = extract_expr_and_chain(&block[i + 1], &local) {
+                if let Some((conditions, final_expr)) =
+                    extract_expr_and_chain(&block[i + 1], &local)
+                {
                     if !conditions.is_empty() {
                         // Build: expr1 and cond1 and cond2 and ... and finalExpr
                         let mut combined = initial_value.clone();
@@ -2204,10 +2285,22 @@ fn is_negation_of(condition: &RValue, original: &RValue) -> bool {
                 (cond_bin.operation, orig_bin.operation),
                 (BinaryOperation::Equal, BinaryOperation::NotEqual)
                     | (BinaryOperation::NotEqual, BinaryOperation::Equal)
-                    | (BinaryOperation::LessThan, BinaryOperation::GreaterThanOrEqual)
-                    | (BinaryOperation::GreaterThanOrEqual, BinaryOperation::LessThan)
-                    | (BinaryOperation::LessThanOrEqual, BinaryOperation::GreaterThan)
-                    | (BinaryOperation::GreaterThan, BinaryOperation::LessThanOrEqual)
+                    | (
+                        BinaryOperation::LessThan,
+                        BinaryOperation::GreaterThanOrEqual
+                    )
+                    | (
+                        BinaryOperation::GreaterThanOrEqual,
+                        BinaryOperation::LessThan
+                    )
+                    | (
+                        BinaryOperation::LessThanOrEqual,
+                        BinaryOperation::GreaterThan
+                    )
+                    | (
+                        BinaryOperation::GreaterThan,
+                        BinaryOperation::LessThanOrEqual
+                    )
             );
 
             if is_negated {
@@ -2325,7 +2418,8 @@ fn extract_nested_and_chain(
             // Check intermediate is: local intermediate_ = expr
             if intermediate_assign.left.len() == 1
                 && intermediate_assign.right.len() == 1
-                && intermediate_assign.prefix  // Must be a local declaration
+                && intermediate_assign.prefix
+            // Must be a local declaration
             {
                 if let Some(intermediate_local) = intermediate_assign.left[0].as_local() {
                     // Check intermediate is an unnamed temp
@@ -2341,10 +2435,8 @@ fn extract_nested_and_chain(
                                         && final_local.name() == target_local.name());
                                 if same_local {
                                     // Check if the final assignment uses the intermediate local
-                                    let final_reads_intermediate = final_assign.right[0]
-                                        .values_read()
-                                        .iter()
-                                        .any(|l| {
+                                    let final_reads_intermediate =
+                                        final_assign.right[0].values_read().iter().any(|l| {
                                             *l == intermediate_local
                                                 || (l.name().is_some()
                                                     && l.name() == intermediate_local.name())
@@ -2430,7 +2522,9 @@ fn extract_expr_and_chain(
             if let Some(local) = assign.left[0].as_local() {
                 let same_local = local == target_local
                     || (local.name().is_some() && local.name() == target_local.name());
-                if !same_local || !matches!(&assign.right[0], RValue::Literal(Literal::Boolean(false))) {
+                if !same_local
+                    || !matches!(&assign.right[0], RValue::Literal(Literal::Boolean(false)))
+                {
                     return None;
                 }
             } else {
@@ -2495,7 +2589,10 @@ fn extract_true_or_chain(
     }
 
     // Don't match if the new value is also true (that would be pointless)
-    if matches!(&then_assign.right[0], RValue::Literal(Literal::Boolean(true))) {
+    if matches!(
+        &then_assign.right[0],
+        RValue::Literal(Literal::Boolean(true))
+    ) {
         return None;
     }
 
@@ -2557,7 +2654,9 @@ fn collapse_multi_return_assignments(block: &mut Block) {
         }
 
         // Get all left-hand side locals
-        let locals: Vec<_> = assign.left.iter()
+        let locals: Vec<_> = assign
+            .left
+            .iter()
             .filter_map(|lv| lv.as_local())
             .cloned()
             .collect();
@@ -2569,11 +2668,12 @@ fn collapse_multi_return_assignments(block: &mut Block) {
         }
 
         // Right side must be a call (or method call), possibly wrapped in Select for multi-return
-        let is_call = matches!(&assign.right[0],
-            RValue::Call(_) |
-            RValue::MethodCall(_) |
-            RValue::Select(Select::Call(_)) |
-            RValue::Select(Select::MethodCall(_))
+        let is_call = matches!(
+            &assign.right[0],
+            RValue::Call(_)
+                | RValue::MethodCall(_)
+                | RValue::Select(Select::Call(_))
+                | RValue::Select(Select::MethodCall(_))
         );
         if !is_call {
             i += 1;
@@ -2664,7 +2764,8 @@ fn collapse_multi_return_assignments(block: &mut Block) {
                     let is_unnamed_temp = local.name().map_or(true, |n| is_unnamed_temporary(&n));
                     if !is_unnamed_temp {
                         // Named local - check if it's only used once
-                        let read_count = local.name()
+                        let read_count = local
+                            .name()
                             .and_then(|n| local_read_counts.get(&n))
                             .copied()
                             .unwrap_or(0);
@@ -2810,8 +2911,8 @@ impl DeadStoreRemover {
                     if let LValue::Local(lhs) = &assign.left[0] {
                         if let RValue::Local(rhs) = &assign.right[0] {
                             // Self-assignment check
-                            let same = lhs == rhs
-                                || (lhs.name().is_some() && lhs.name() == rhs.name());
+                            let same =
+                                lhs == rhs || (lhs.name().is_some() && lhs.name() == rhs.name());
                             if same {
                                 to_remove.push(i);
                                 i += 1;
@@ -2867,8 +2968,7 @@ impl DeadStoreRemover {
                     if let LValue::Local(local) = lv {
                         // Remove any temp whose source is being reassigned
                         self.temp_sources.retain(|_, (src, _)| {
-                            src != local
-                                && !(src.name().is_some() && src.name() == local.name())
+                            src != local && !(src.name().is_some() && src.name() == local.name())
                         });
                     }
                 }
@@ -2929,7 +3029,8 @@ pub fn remove_dead_locals(block: &mut Block) {
     collect_local_usage(block, &mut reads, &mut writes, 0);
 
     // Find locals that are written but never read
-    let dead_locals: FxHashSet<_> = writes.keys()
+    let dead_locals: FxHashSet<_> = writes
+        .keys()
         .filter(|local| {
             // Only remove unnamed temporaries
             local.name().map_or(true, |n| is_unnamed_temporary(&n))
@@ -2962,7 +3063,10 @@ fn collect_local_usage(
 
         // Collect writes from this statement
         for local in stmt.values_written() {
-            writes.entry(local.clone()).or_default().push(base_index + i);
+            writes
+                .entry(local.clone())
+                .or_default()
+                .push(base_index + i);
         }
 
         // Recurse into nested blocks
@@ -3025,12 +3129,12 @@ fn remove_dead_local_assignments(block: &mut Block, dead_locals: &FxHashSet<RcLo
         if let Some(assign) = stmt.as_assign() {
             // Check if this assignment ONLY writes to dead locals
             // and the RHS has no side effects
-            if assign.left.len() == 1
-                && !assign.right.iter().any(|r| r.has_side_effects())
-            {
+            if assign.left.len() == 1 && !assign.right.iter().any(|r| r.has_side_effects()) {
                 if let Some(local) = assign.left[0].as_local() {
                     let is_dead = dead_locals.contains(local)
-                        || dead_locals.iter().any(|d| d.name().is_some() && d.name() == local.name());
+                        || dead_locals
+                            .iter()
+                            .any(|d| d.name().is_some() && d.name() == local.name());
                     if is_dead {
                         return false; // Remove this statement
                     }
@@ -3356,9 +3460,10 @@ fn coalesce_reassignments(block: &mut Block) {
     for &i in &statements_to_modify {
         if let Some(assign) = block[i].as_assign_mut() {
             // Change left side from temp to named
-            if let Some((_, named)) = replacements.iter().find(|(t, _)| {
-                assign.left[0].as_local().map(|l| l == t).unwrap_or(false)
-            }) {
+            if let Some((_, named)) = replacements
+                .iter()
+                .find(|(t, _)| assign.left[0].as_local().map(|l| l == t).unwrap_or(false))
+            {
                 assign.left[0] = named.clone().into();
                 assign.prefix = false; // No longer a local declaration
             }
@@ -3614,8 +3719,7 @@ fn count_local_uses_recursive(statement: &Statement, local: &RcLocal) -> usize {
 
     // Count direct uses in this statement
     for read_local in statement.values_read() {
-        if read_local == local
-            || (read_local.name().is_some() && read_local.name() == local.name())
+        if read_local == local || (read_local.name().is_some() && read_local.name() == local.name())
         {
             count += 1;
         }
@@ -3737,7 +3841,10 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
         let rhs = &assign.right[0];
         let is_boolean_expr = is_boolean_expression(rhs);
         // Allow function calls (Call, MethodCall) and Select (for multi-return calls)
-        let is_call_like = matches!(rhs, RValue::Call(_) | RValue::MethodCall(_) | RValue::Select(_));
+        let is_call_like = matches!(
+            rhs,
+            RValue::Call(_) | RValue::MethodCall(_) | RValue::Select(_)
+        );
         if !is_boolean_expr && !is_call_like {
             i += 1;
             continue;
@@ -3800,7 +3907,6 @@ fn simplify_boolean_condition_assignments(block: &mut Block) {
         for j in (i + 2)..block.len() {
             uses_after_if += count_local_uses_recursive(&block[j], &local);
         }
-
 
         // If there are uses after the if, we can't remove the assignment
         if uses_after_if > 0 {
@@ -4032,8 +4138,8 @@ fn inline_into_returns(block: &mut Block) {
             continue;
         };
 
-        let same_local = ret_local == local
-            || (ret_local.name().is_some() && ret_local.name() == local.name());
+        let same_local =
+            ret_local == local || (ret_local.name().is_some() && ret_local.name() == local.name());
 
         if !same_local {
             i += 1;
@@ -4165,7 +4271,8 @@ fn simplify_set_list_patterns(block: &mut Block) {
             // Check if this is the SetList we're looking for
             if let Some(set_list) = block[j].as_set_list() {
                 let same_local = &set_list.object_local == local
-                    || (set_list.object_local.name().is_some() && set_list.object_local.name() == local.name());
+                    || (set_list.object_local.name().is_some()
+                        && set_list.object_local.name() == local.name());
                 if same_local && set_list.index == 1 {
                     set_list_idx = Some(j);
                     break;
@@ -4183,9 +4290,9 @@ fn simplify_set_list_patterns(block: &mut Block) {
                 });
                 // Check if it reads our local
                 let reads_local = assign.right.iter().any(|rv| {
-                    rv.values_read().iter().any(|l| {
-                        *l == local || (l.name().is_some() && l.name() == local.name())
-                    })
+                    rv.values_read()
+                        .iter()
+                        .any(|l| *l == local || (l.name().is_some() && l.name() == local.name()))
                 });
 
                 if writes_local || reads_local {
@@ -4442,7 +4549,9 @@ fn simplify_write_only_locals(block: &mut Block) {
         }
 
         // Collect the declared locals
-        let declared_locals: Vec<RcLocal> = assign.left.iter()
+        let declared_locals: Vec<RcLocal> = assign
+            .left
+            .iter()
             .filter_map(|lv| lv.as_local().cloned())
             .collect();
 
@@ -4453,7 +4562,8 @@ fn simplify_write_only_locals(block: &mut Block) {
 
         // Check if ALL declared locals are unnamed temporaries and never read
         let all_write_only = declared_locals.iter().all(|local| {
-            let is_unnamed = local.name()
+            let is_unnamed = local
+                .name()
                 .map(|n| is_unnamed_temporary(&n))
                 .unwrap_or(true);
             let never_read = !locals_read.contains(local);
@@ -4483,7 +4593,9 @@ fn simplify_write_only_locals(block: &mut Block) {
         }
 
         // Check if this assignment writes to any of our declared locals
-        let writes_to_declared: Vec<usize> = next_assign.left.iter()
+        let writes_to_declared: Vec<usize> = next_assign
+            .left
+            .iter()
             .enumerate()
             .filter_map(|(idx, lv)| {
                 lv.as_local().and_then(|l| {
@@ -4518,13 +4630,19 @@ fn simplify_write_only_locals(block: &mut Block) {
         // Remove the empty declaration if all its locals are now replaced
         let all_replaced = declared_locals.iter().all(|dl| {
             writes_to_declared.iter().any(|&idx| {
-                block[i + 1].as_assign()
+                block[i + 1]
+                    .as_assign()
                     .and_then(|a| a.left.get(idx))
                     .and_then(|lv| lv.as_local())
                     .map(|l| l.name() == Some("_".to_string()))
                     .unwrap_or(false)
-            }) || !block[i + 1].as_assign()
-                .map(|a| a.left.iter().any(|lv| lv.as_local().map(|l| l == dl).unwrap_or(false)))
+            }) || !block[i + 1]
+                .as_assign()
+                .map(|a| {
+                    a.left
+                        .iter()
+                        .any(|lv| lv.as_local().map(|l| l == dl).unwrap_or(false))
+                })
                 .unwrap_or(false)
         });
 
@@ -4752,7 +4870,8 @@ fn collapse_table_field_assignments(block: &mut Block) {
                     if let Some(index) = assign.left[0].as_index() {
                         if let Some(index_local) = index.left.as_local() {
                             index_local == &local
-                                || (index_local.name().is_some() && index_local.name() == local.name())
+                                || (index_local.name().is_some()
+                                    && index_local.name() == local.name())
                         } else {
                             false
                         }
