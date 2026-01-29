@@ -399,7 +399,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 write!(self.output, "function ")?;
                 self.format_rvalue(&index.left)?;
                 // Use : instead of . for the method name
-                if let box RValue::Literal(Literal::String(method_name)) = &index.right {
+                if let RValue::Literal(Literal::String(ref method_name)) = *index.right {
                     write!(
                         self.output,
                         ":{}",
@@ -649,7 +649,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                     let mut index = index;
                     let mut valid = true;
                     loop {
-                        if let box RValue::Literal(Literal::String(key)) = &index.right
+                        if let RValue::Literal(Literal::String(ref key)) = *index.right
                             && Self::is_valid_name(key)
                         {
                             match index.left {
