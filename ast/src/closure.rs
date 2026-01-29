@@ -59,7 +59,6 @@ impl fmt::Display for Closure {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Formatter {
             indentation_level: 0,
-            indentation_mode: Default::default(),
             output: f,
         }
         .format_closure(self)

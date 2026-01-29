@@ -15,19 +15,21 @@ use std::cell::Cell;
 
 thread_local! {
     // Global thread variable for now
-    pub static DEBUG_FUNCTIONS_LINE_INFO: Cell<bool> = Cell::new(false);
+    pub static FORMATTER_NAMED_FUNCTIONS_LINE_INFO: Cell<bool> = Cell::new(false);
+    pub static FORMATTER_INDENTATION_MODE: Cell<IndentationMode> = Cell::new(IndentationMode::Spaces(4));
 }
 
+#[derive(Clone, Copy)]
 pub enum IndentationMode {
     Spaces(u8),
-    Tab,
+    Tab(u8),
 }
 
 impl IndentationMode {
     pub fn display(&self, out: &mut impl fmt::Write, indentation_level: usize) -> fmt::Result {
         let string = match self {
             Self::Spaces(spaces) => Cow::Owned(" ".repeat(*spaces as usize)),
-            Self::Tab => Cow::Borrowed("\u{09}"),
+            Self::Tab(size) => Cow::Owned("\u{09}".repeat(*size as usize)),
         };
         for _ in 0..indentation_level {
             out.write_str(&string)?;
@@ -44,7 +46,7 @@ impl fmt::Display for IndentationMode {
 
 impl Default for IndentationMode {
     fn default() -> Self {
-        Self::Tab
+        Self::Spaces(4)
     }
 }
 
@@ -66,26 +68,24 @@ pub(crate) fn format_arg_list(list: &[RValue]) -> String {
 
 pub struct Formatter<'a, W: fmt::Write> {
     pub(crate) indentation_level: usize,
-    pub(crate) indentation_mode: IndentationMode,
     pub(crate) output: &'a mut W,
 }
 
 impl<'a, W: fmt::Write> Formatter<'a, W> {
-    pub fn format(
-        main: &Block,
-        output: &'a mut W,
-        indentation_mode: IndentationMode,
-    ) -> fmt::Result {
+    pub fn format(main: &Block, output: &'a mut W) -> fmt::Result {
         let mut formatter = Self {
             indentation_level: 0,
-            indentation_mode,
             output,
         };
         formatter.format_block_no_indent(main)
     }
 
+    fn get_indent_mode(&self) -> IndentationMode {
+        FORMATTER_INDENTATION_MODE.with(|v| v.get())
+    }
+
     fn indent(&mut self) -> fmt::Result {
-        self.indentation_mode
+        self.get_indent_mode()
             .display(&mut self.output, self.indentation_level)
     }
 
@@ -365,7 +365,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         // TODO
         // - Should we limit this to only direct children of main proto?
 
-        if DEBUG_FUNCTIONS_LINE_INFO.with(|v| v.get()) {
+        if FORMATTER_NAMED_FUNCTIONS_LINE_INFO.with(|v| v.get()) {
             let (line_defined, last_line) = closure.function.lock().line_info;
 
             if last_line != 0 && last_line != line_defined {

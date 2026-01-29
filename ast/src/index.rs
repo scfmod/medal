@@ -1,4 +1,4 @@
-use crate::{formatter::Formatter, has_side_effects, LocalRw, RcLocal, Traverse};
+use crate::{LocalRw, RcLocal, Traverse, formatter::Formatter, has_side_effects};
 
 use super::RValue;
 use std::fmt;
@@ -53,7 +53,6 @@ impl fmt::Display for Index {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Formatter {
             indentation_level: 0,
-            indentation_mode: Default::default(),
             output: f,
         }
         .format_index(self)

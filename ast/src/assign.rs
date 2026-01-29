@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{formatter::Formatter, RcLocal, SideEffects, Traverse};
+use crate::{RcLocal, SideEffects, Traverse, formatter::Formatter};
 
 use super::{LValue, LocalRw, RValue};
 
@@ -77,7 +77,6 @@ impl fmt::Display for Assign {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Formatter {
             indentation_level: 0,
-            indentation_mode: Default::default(),
             output: f,
         }
         .format_assign(self)

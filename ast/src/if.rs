@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use triomphe::Arc;
 
-use crate::{formatter::Formatter, LocalRw, RcLocal, SideEffects, Traverse};
+use crate::{LocalRw, RcLocal, SideEffects, Traverse, formatter::Formatter};
 
 use super::{Block, RValue};
 
@@ -62,7 +62,6 @@ impl fmt::Display for If {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Formatter {
             indentation_level: 0,
-            indentation_mode: Default::default(),
             output: f,
         }
         .format_if(self)

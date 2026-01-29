@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{formatter::Formatter, has_side_effects, LocalRw, RcLocal, Traverse};
+use crate::{LocalRw, RcLocal, Traverse, formatter::Formatter, has_side_effects};
 
 use super::RValue;
 
@@ -44,7 +44,6 @@ impl fmt::Display for Return {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Formatter {
             indentation_level: 0,
-            indentation_mode: Default::default(),
             output: f,
         }
         .format_return(self)

@@ -4,9 +4,13 @@ mod lifter;
 mod op_code;
 
 use ast::{
-    cleanup_for_statements::cleanup_for_statements, formatter::DEBUG_FUNCTIONS_LINE_INFO,
-    inline_temporaries::inline_temporaries, local_declarations::LocalDeclarer,
-    name_locals::name_locals, replace_locals::replace_locals, Traverse,
+    cleanup_for_statements::cleanup_for_statements,
+    formatter::{IndentationMode, FORMATTER_INDENTATION_MODE, FORMATTER_NAMED_FUNCTIONS_LINE_INFO},
+    inline_temporaries::inline_temporaries,
+    local_declarations::LocalDeclarer,
+    name_locals::name_locals,
+    replace_locals::replace_locals,
+    Traverse,
 };
 
 use by_address::ByAddress;
@@ -117,8 +121,10 @@ pub fn decompile_bytecode_with_opts(
     bytecode: &[u8],
     encode_key: u8,
     write_function_line_info: bool,
+    indentation_mode: IndentationMode,
 ) -> String {
-    DEBUG_FUNCTIONS_LINE_INFO.with(|v| v.set(write_function_line_info));
+    FORMATTER_NAMED_FUNCTIONS_LINE_INFO.with(|v| v.set(write_function_line_info));
+    FORMATTER_INDENTATION_MODE.with(|v| v.set(indentation_mode));
 
     decompile_bytecode(bytecode, encode_key)
 }

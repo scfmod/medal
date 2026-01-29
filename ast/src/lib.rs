@@ -45,21 +45,20 @@ mod r#while;
 
 pub use assign::*;
 pub use binary::*;
+pub use r#break::*;
 pub use call::*;
 pub use close::*;
 pub use closure::*;
+pub use r#continue::*;
+pub use r#for::*;
 pub use global::*;
 pub use goto::*;
+pub use r#if::*;
 pub use index::*;
 pub use literal::*;
 pub use local::*;
-pub use r#break::*;
-pub use r#continue::*;
-pub use r#for::*;
-pub use r#if::*;
-pub use r#return::*;
-pub use r#while::*;
 pub use repeat::*;
+pub use r#return::*;
 pub use set_list::*;
 pub use side_effects::*;
 pub use table::*;
@@ -67,6 +66,7 @@ pub use traverse::*;
 use type_system::{Type, TypeSystem};
 pub use unary::*;
 pub use vararg::*;
+pub use r#while::*;
 
 pub trait Reduce {
     fn reduce(self) -> RValue;
@@ -356,6 +356,6 @@ impl DerefMut for Block {
 
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        Formatter::format(self, f, Default::default())
+        Formatter::format(self, f)
     }
 }
