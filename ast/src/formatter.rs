@@ -11,6 +11,13 @@ use crate::{
     MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement, Table, Unary, While,
 };
 
+use std::cell::Cell;
+
+thread_local! {
+    // Global thread variable for now
+    pub static DEBUG_FUNCTIONS_LINE_INFO: Cell<bool> = Cell::new(false);
+}
+
 pub enum IndentationMode {
     Spaces(u8),
     Tab,
@@ -352,6 +359,28 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     fn format_named_function(&mut self, name: &LValue, closure: &Closure) -> fmt::Result {
+        // Write function line defined (and last line if found) before named function declaration
+        // Only when DEBUG_FUNCTIONS_LINE_INFO is set to true
+        //
+        // TODO
+        // - Should we limit this to only direct children of main proto?
+
+        if DEBUG_FUNCTIONS_LINE_INFO.with(|v| v.get()) {
+            let (line_defined, last_line) = closure.function.lock().line_info;
+
+            if last_line != 0 && last_line != line_defined {
+                writeln!(self.output, "")?;
+                self.indent()?;
+                writeln!(self.output, "-- Line: {} -> {}", line_defined, last_line)?;
+                self.indent()?;
+            } else {
+                writeln!(self.output, "")?;
+                self.indent()?;
+                writeln!(self.output, "-- Line: {}", line_defined)?;
+                self.indent()?;
+            }
+        }
+
         // Check if first parameter is named "self" and name is a table index
         // If so, convert to method notation: function Table:method() instead of function Table.method(self)
         let first_param_is_self = {

@@ -4,9 +4,9 @@ mod lifter;
 mod op_code;
 
 use ast::{
-    cleanup_for_statements::cleanup_for_statements, inline_temporaries::inline_temporaries,
-    local_declarations::LocalDeclarer, name_locals::name_locals, replace_locals::replace_locals,
-    Traverse,
+    cleanup_for_statements::cleanup_for_statements, formatter::DEBUG_FUNCTIONS_LINE_INFO,
+    inline_temporaries::inline_temporaries, local_declarations::LocalDeclarer,
+    name_locals::name_locals, replace_locals::replace_locals, Traverse,
 };
 
 use by_address::ByAddress;
@@ -111,6 +111,16 @@ pub fn dump_bytecode(bytecode: &[u8], encode_key: u8, func_name: Option<&str>) {
             }
         }
     }
+}
+
+pub fn decompile_bytecode_with_opts(
+    bytecode: &[u8],
+    encode_key: u8,
+    write_function_line_info: bool,
+) -> String {
+    DEBUG_FUNCTIONS_LINE_INFO.with(|v| v.set(write_function_line_info));
+
+    decompile_bytecode(bytecode, encode_key)
 }
 
 pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {

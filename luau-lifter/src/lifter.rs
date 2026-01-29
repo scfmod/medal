@@ -1331,6 +1331,7 @@ impl<'a> Lifter<'a> {
                         self.child_functions
                             .insert(ByAddress(function.clone()), func_index);
                         function.lock().name = func_name;
+                        function.lock().line_info = func.line_info.clone();
                         statements.push(
                             ast::Assign::new(
                                 vec![dest_local.into()],
