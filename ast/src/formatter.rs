@@ -16,20 +16,20 @@ use std::cell::Cell;
 thread_local! {
     // Global thread variable for now
     pub static FORMATTER_NAMED_FUNCTIONS_LINE_INFO: Cell<bool> = Cell::new(false);
-    pub static FORMATTER_INDENTATION_MODE: Cell<IndentationMode> = Cell::new(IndentationMode::Spaces(4));
+    pub static FORMATTER_INDENTATION_MODE: Cell<IndentationMode> = Cell::new(IndentationMode::Tab);
 }
 
 #[derive(Clone, Copy)]
 pub enum IndentationMode {
     Spaces(u8),
-    Tab(u8),
+    Tab,
 }
 
 impl IndentationMode {
     pub fn display(&self, out: &mut impl fmt::Write, indentation_level: usize) -> fmt::Result {
         let string = match self {
             Self::Spaces(spaces) => Cow::Owned(" ".repeat(*spaces as usize)),
-            Self::Tab(size) => Cow::Owned("\u{09}".repeat(*size as usize)),
+            Self::Tab => Cow::Borrowed("\u{09}"),
         };
         for _ in 0..indentation_level {
             out.write_str(&string)?;
@@ -46,7 +46,7 @@ impl fmt::Display for IndentationMode {
 
 impl Default for IndentationMode {
     fn default() -> Self {
-        Self::Spaces(4)
+        Self::Tab
     }
 }
 
