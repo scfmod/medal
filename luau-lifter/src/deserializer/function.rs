@@ -166,21 +166,20 @@ impl Function {
                     ((u32_instructions.len() - 1) >> line_gap_log2.unwrap()) + 1,
                 )?;
 
-                let mut last_offset: u8 = 0;
-                for value in line_info_delta.iter() {
-                    last_offset = last_offset.wrapping_add(*value);
-                }
+                let last_line = {
+                    let line_delta: u8 =
+                        line_info_delta.iter().copied().fold(0u8, u8::wrapping_add);
 
-                let mut last_line = 0;
-                for value in abs_line_info_delta.iter() {
-                    last_line += *value as usize;
-                }
+                    let abs_line_delta: usize = abs_line_info_delta
+                        .iter()
+                        .copied()
+                        .map(|v| v as usize)
+                        .sum();
 
-                (
-                    input,
-                    Some(abs_line_info_delta),
-                    last_line + last_offset as usize,
-                )
+                    line_delta as usize + abs_line_delta
+                };
+
+                (input, Some(abs_line_info_delta), last_line)
             }
         };
         let (input, (local_debug_info, upvalue_debug_names)) = match le_u8(input)? {
