@@ -936,6 +936,10 @@ impl Inliner {
             return None;
         };
 
+        if let RValue::Binary(_) = &assign.right[0] {
+            return None;
+        };
+
         // We only check that a name exists, the filtering based on whether
         // it's unnamed or side-effect-free is done in find_inline_candidates
         local.name()?;
