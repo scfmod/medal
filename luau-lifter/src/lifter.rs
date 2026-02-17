@@ -165,7 +165,7 @@ impl<'a> Lifter<'a> {
             let index = info.register as usize;
             // Skip if already in map (e.g., parameters) - but only if it has a valid name
             if let Some(existing) = self.register_map.get(&(index, 0)) {
-                if existing.name().is_some() {
+                if existing.name().as_deref().is_some_and(|n| n != "_") {
                     continue;
                 }
             }

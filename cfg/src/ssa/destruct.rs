@@ -106,6 +106,8 @@ impl<'a> Destructor<'a> {
 
         super::construct::apply_local_map(self.function, self.build_local_map());
 
+        Self::fix_duplicate_for_var_names(self.function);
+
         //crate::dot::render_to(self.function, &mut std::io::stdout()).unwrap();
 
         self.sequentialize();
@@ -245,11 +247,12 @@ impl<'a> Destructor<'a> {
             if con_class.is_empty() {
                 continue;
             }
-            // Prefer a local with a debug name if any exists in the congruence class
-            // Fall back to the first (by dominator order) if none have names
+            // Prefer a local with a meaningful debug name (not "_") if any exists.
+            // Fall back to any named local, then to the first by dominator order.
             let new_local = con_class
                 .iter()
-                .find(|(_, l)| l.name().is_some())
+                .find(|(_, l)| l.name().as_deref().is_some_and(|n| n != "_"))
+                .or_else(|| con_class.iter().find(|(_, l)| l.name().is_some()))
                 .map(|(_, l)| l)
                 .unwrap_or_else(|| con_class.iter().next().unwrap().1);
             // TODO: see apply_local_map TODO,
@@ -259,6 +262,50 @@ impl<'a> Destructor<'a> {
             }
         }
         map
+    }
+
+    /// After apply_local_map, different congruence classes may have representatives
+    /// with the same debug name. When two such locals appear as res_locals of the
+    /// same GenericForNext (which becomes `for x, x in ...`), we need to rename
+    /// duplicates. Since apply_local_map has already run, each res_local is a
+    /// distinct RcLocal from a different congruence class, so set_name only affects
+    /// references within that class.
+    ///
+    /// In generic for-loops (`for k, v in ...`), the first variable is the key and
+    /// later ones are values. When both got the same name from the bytecode debug
+    /// info, the earlier (key) variable is the one the programmer likely left as `_`,
+    /// so we rename the earlier occurrence.
+    fn fix_duplicate_for_var_names(function: &mut Function) {
+        for node in function.graph().node_indices().collect::<Vec<_>>() {
+            for stat in function.block_mut(node).unwrap().iter_mut() {
+                let res_locals = match stat {
+                    ast::Statement::GenericForNext(gfn) => {
+                        gfn.res_locals
+                            .iter()
+                            .filter_map(|lv| lv.as_local())
+                            .collect::<Vec<_>>()
+                    }
+                    _ => continue,
+                };
+
+                // Collect all names and their positions, then rename earlier
+                // occurrences of duplicated names to `_`.
+                let mut last_seen: FxHashMap<String, usize> = FxHashMap::default();
+                let mut to_rename = Vec::new();
+
+                for (i, local) in res_locals.iter().enumerate() {
+                    if let Some(name) = local.name() {
+                        if let Some(prev_idx) = last_seen.insert(name, i) {
+                            to_rename.push(prev_idx);
+                        }
+                    }
+                }
+
+                for idx in to_rename {
+                    res_locals[idx].set_name(Some("_".to_string()));
+                }
+            }
+        }
     }
 
     // TODO: combine with compute value interference
@@ -311,14 +358,18 @@ impl<'a> Destructor<'a> {
                 }
             }
 
-            if let Some((_, edge)) = self.function.edges_to_block(node).next() {
-                for (param_index, (param, _)) in
-                    edge.arguments.iter().enumerate().collect::<Vec<_>>()
-                {
-                    self.local_defs.insert(
-                        param.clone(),
-                        (dominator_index, node, ParamOrStatIndex::Param(param_index)),
-                    );
+            // Collect params from ALL incoming edges (not just the first).
+            // Different edges may have different param sets after structuring passes.
+            let mut param_index = 0;
+            for (_, edge) in self.function.edges_to_block(node) {
+                for (param, _) in edge.arguments.iter() {
+                    if !self.local_defs.contains_key(param) {
+                        self.local_defs.insert(
+                            param.clone(),
+                            (dominator_index, node, ParamOrStatIndex::Param(param_index)),
+                        );
+                        param_index += 1;
+                    }
                 }
             }
             for (stat_index, stat) in self.function.block(node).unwrap().0.iter().enumerate() {

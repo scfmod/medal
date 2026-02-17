@@ -18,7 +18,7 @@ use cfg::{
     function::Function,
     ssa::{
         self,
-        structuring::{structure_conditionals, structure_jumps},
+        structuring::{structure_conditionals, structure_jumps, structure_or_chains},
     },
 };
 use indexmap::IndexMap;
@@ -272,6 +272,12 @@ fn decompile_function(
         if structure_conditionals(&mut function) {
             changed = true;
             dominators_valid = false; // CFG changed, invalidate dominators
+        }
+
+        // Structure or-chains: multiple conditions jumping to same target
+        if structure_or_chains(&mut function) {
+            changed = true;
+            dominators_valid = false;
         }
 
         let mut local_map = FxHashMap::default();

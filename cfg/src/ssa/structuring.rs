@@ -7,7 +7,7 @@ use petgraph::{
     stable_graph::{EdgeIndex, NodeIndex},
     visit::{DfsPostOrder, EdgeRef},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tuple::Map;
 
 use crate::{
@@ -268,6 +268,61 @@ fn match_conditional_sequence(
     }
 }
 
+/// Apply a single conditional sequence pattern, merging two nodes into one compound condition.
+fn apply_conditional_sequence(function: &mut Function, pattern: ConditionalSequencePattern) {
+    let second_to_sc_edges = function
+        .edges(pattern.second_node)
+        .filter(|e| e.target() == pattern.short_circuit)
+        .collect::<Vec<_>>();
+    assert!(second_to_sc_edges.len() == 1);
+    let second_to_sc_args = second_to_sc_edges[0].weight().arguments.clone();
+    let first_to_sc_edges = function
+        .edges(pattern.first_node)
+        .filter(|e| e.target() == pattern.short_circuit)
+        .collect::<Vec<_>>();
+    assert!(first_to_sc_edges.len() == 1);
+    let first_to_sc_edge = first_to_sc_edges[0].id();
+    for arg in &mut function
+        .graph_mut()
+        .edge_weight_mut(first_to_sc_edge)
+        .unwrap()
+        .arguments
+    {
+        if let Some(new_arg) = second_to_sc_args.iter().find(|(k, _)| k == &arg.0) {
+            *arg = new_arg.clone();
+        }
+    }
+
+    let second_terminator = function.conditional_edges(pattern.second_node).unwrap();
+    let other_edge = if second_terminator.0.target() == pattern.short_circuit {
+        second_terminator.1
+    } else {
+        second_terminator.0
+    };
+    let other_edge = other_edge.id();
+    assert!(skip_over_node(function, pattern.first_node, other_edge));
+
+    let mut removed_block = function.remove_block(pattern.second_node).unwrap();
+    let first_node = pattern.first_node;
+    if pattern.assign {
+        let assign = removed_block.first_mut().unwrap().as_assign_mut().unwrap();
+        assign.right = vec![pattern.final_condition.reduce()];
+    } else {
+        let removed_if = removed_block.last_mut().unwrap().as_if_mut().unwrap();
+        removed_if.condition = pattern.final_condition.reduce_condition();
+    }
+    if pattern.inverted {
+        let removed_if = removed_block.last_mut().unwrap().as_if_mut().unwrap();
+        // TODO: unnecessary clone?
+        removed_if.condition =
+            ast::Unary::new(removed_if.condition.clone(), UnaryOperation::Not)
+                .reduce_condition();
+    }
+    let first_block = function.block_mut(first_node).unwrap();
+    first_block.pop();
+    first_block.extend(removed_block.0);
+}
+
 pub fn structure_conditionals(function: &mut Function) -> bool {
     let mut did_structure = false;
     // TODO: does this need to be in dfs post order?
@@ -280,62 +335,20 @@ pub fn structure_conditionals(function: &mut Function) -> bool {
             did_structure = true;
         }
 
-        if let Some(pattern) = match_conditional_sequence(function, node)
-            // TODO: can we continue?
-            && &Some(pattern.second_node) != function.entry()
-        {
-            let second_to_sc_edges = function
-                .edges(pattern.second_node)
-                .filter(|e| e.target() == pattern.short_circuit)
-                .collect::<Vec<_>>();
-            assert!(second_to_sc_edges.len() == 1);
-            let second_to_sc_args = second_to_sc_edges[0].weight().arguments.clone();
-            let first_to_sc_edges = function
-                .edges(pattern.first_node)
-                .filter(|e| e.target() == pattern.short_circuit)
-                .collect::<Vec<_>>();
-            assert!(first_to_sc_edges.len() == 1);
-            let first_to_sc_edge = first_to_sc_edges[0].id();
-            for arg in &mut function
-                .graph_mut()
-                .edge_weight_mut(first_to_sc_edge)
-                .unwrap()
-                .arguments
+        // Keep trying to match conditional sequences from this node until no more matches.
+        // This handles nested compound conditions like `A and (B or C)` which require
+        // multiple merge passes - first merging B and C, then merging A with (B or C).
+        loop {
+            if let Some(pattern) = match_conditional_sequence(function, node)
+                // TODO: can we continue?
+                && &Some(pattern.second_node) != function.entry()
             {
-                if let Some(new_arg) = second_to_sc_args.iter().find(|(k, _)| k == &arg.0) {
-                    *arg = new_arg.clone();
-                }
-            }
-
-            let second_terminator = function.conditional_edges(pattern.second_node).unwrap();
-            let other_edge = if second_terminator.0.target() == pattern.short_circuit {
-                second_terminator.1
+                apply_conditional_sequence(function, pattern);
+                did_structure = true;
+                // Continue loop to try matching again from the same node
             } else {
-                second_terminator.0
-            };
-            let other_edge = other_edge.id();
-            assert!(skip_over_node(function, pattern.first_node, other_edge));
-
-            let mut removed_block = function.remove_block(pattern.second_node).unwrap();
-            let first_node = pattern.first_node;
-            if pattern.assign {
-                let assign = removed_block.first_mut().unwrap().as_assign_mut().unwrap();
-                assign.right = vec![pattern.final_condition.reduce()];
-            } else {
-                let removed_if = removed_block.last_mut().unwrap().as_if_mut().unwrap();
-                removed_if.condition = pattern.final_condition.reduce_condition();
+                break;
             }
-            if pattern.inverted {
-                let removed_if = removed_block.last_mut().unwrap().as_if_mut().unwrap();
-                // TODO: unnecessary clone?
-                removed_if.condition =
-                    ast::Unary::new(removed_if.condition.clone(), UnaryOperation::Not)
-                        .reduce_condition();
-            }
-            let first_block = function.block_mut(first_node).unwrap();
-            first_block.pop();
-            first_block.extend(removed_block.0);
-            did_structure = true;
         }
 
         did_structure |= try_remove_unnecessary_condition(function, node);
@@ -955,5 +968,188 @@ pub fn structure_jumps(function: &mut Function, dominators: &Dominators<NodeInde
             }
         }
     }
+    did_structure
+}
+
+/// Match and structure or-chain patterns where multiple conditional nodes all jump
+/// to the same target on their "then" branch, forming an or-chain.
+///
+/// Pattern in CFG:
+/// ```
+/// A: if cond1 then -> BODY else -> B
+/// B: if cond2 then -> BODY else -> C
+/// C: if cond3 then -> BODY else -> EXIT
+/// ```
+///
+/// Should become: `if cond1 or cond2 or cond3 then BODY else EXIT`
+pub fn structure_or_chains(function: &mut Function) -> bool {
+    let mut did_structure = false;
+
+    // Find nodes that are targets of multiple conditional "then" edges
+    let mut then_target_counts: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
+
+    for node in function.graph().node_indices().collect_vec() {
+        if let Some((then_edge, _else_edge)) = function.conditional_edges(node) {
+            let target = then_edge.target();
+            then_target_counts.entry(target).or_default().push(node);
+        }
+    }
+
+    for (body_target, sources) in then_target_counts {
+        if sources.len() < 2 {
+            continue;
+        }
+
+        // Check if these sources form a chain: A -> B -> C -> ... where each
+        // node's "else" edge goes to the next node in the chain
+        let mut remaining: FxHashSet<_> = sources.iter().cloned().collect();
+
+        // Find the start of the chain - a node whose predecessor is NOT in our source set
+        let mut chain_start = None;
+        for &node in &sources {
+            let has_pred_in_sources = function
+                .predecessor_blocks(node)
+                .any(|p| remaining.contains(&p));
+            if !has_pred_in_sources {
+                chain_start = Some(node);
+                break;
+            }
+        }
+
+        let Some(start) = chain_start else { continue };
+
+        // Build the chain by following else edges
+        let mut chain: Vec<NodeIndex> = Vec::new();
+        let mut current = start;
+        while remaining.remove(&current) {
+            chain.push(current);
+            if let Some((_then_edge, else_edge)) = function.conditional_edges(current) {
+                let else_target = else_edge.target();
+                if remaining.contains(&else_target) {
+                    current = else_target;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if chain.len() < 2 {
+            continue;
+        }
+
+        // Verify the chain structure
+        let mut valid = true;
+        let mut conditions: Vec<ast::RValue> = Vec::new();
+
+        for (i, &node) in chain.iter().enumerate() {
+            let block = function.block(node).unwrap();
+
+            let Some(if_stat) = block.last().and_then(|s| s.as_if()) else {
+                valid = false;
+                break;
+            };
+
+            if block.len() != 1 {
+                valid = false;
+                break;
+            }
+
+            conditions.push(if_stat.condition.clone());
+
+            let Some((then_edge, else_edge)) = function.conditional_edges(node) else {
+                valid = false;
+                break;
+            };
+
+            if then_edge.target() != body_target {
+                valid = false;
+                break;
+            }
+
+            if i < chain.len() - 1 {
+                if else_edge.target() != chain[i + 1] {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+
+        if !valid || conditions.is_empty() {
+            continue;
+        }
+
+        let last_node = *chain.last().unwrap();
+        let Some((_then_edge, else_edge)) = function.conditional_edges(last_node) else {
+            continue;
+        };
+        let else_destination = else_edge.target();
+
+        if else_destination == body_target {
+            continue;
+        }
+
+        // Check if any edge in the chain carries arguments (phi params).
+        // If so, we can't safely merge because each chain node has a separate
+        // edge to body_target with potentially different arguments.
+        let mut has_args = false;
+        for &node in &chain {
+            if let Some((then_edge, else_edge)) = function.conditional_edges(node) {
+                if !then_edge.weight().arguments.is_empty() || !else_edge.weight().arguments.is_empty() {
+                    has_args = true;
+                    break;
+                }
+            }
+        }
+        if !has_args {
+            for &node in &chain[..chain.len() - 1] {
+                if let Some((_, else_edge)) = function.conditional_edges(node) {
+                    if !else_edge.weight().arguments.is_empty() {
+                        has_args = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if has_args {
+            continue;
+        }
+
+        // Build the combined or condition
+        let mut combined_condition = conditions[0].clone();
+        for cond in &conditions[1..] {
+            combined_condition = ast::Binary::new(
+                combined_condition,
+                cond.clone(),
+                ast::BinaryOperation::Or,
+            ).into();
+        }
+
+        // Update the first node's condition
+        let first_node = chain[0];
+        {
+            let block = function.block_mut(first_node).unwrap();
+            let if_stat = block.last_mut().unwrap().as_if_mut().unwrap();
+            if_stat.condition = combined_condition;
+        }
+
+        // Update edges
+        function.set_edges(
+            first_node,
+            vec![
+                (body_target, BlockEdge::new(BranchType::Then)),
+                (else_destination, BlockEdge::new(BranchType::Else)),
+            ],
+        );
+
+        // Remove intermediate nodes
+        for &node in &chain[1..] {
+            function.remove_block(node);
+        }
+
+        did_structure = true;
+    }
+
     did_structure
 }
