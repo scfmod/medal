@@ -119,8 +119,13 @@ impl Inliner {
                 }
             }
 
-            // Note: we DON'T clear immediate_inlines or deferred_inlines here anymore -
-            // they persist until applied to a later statement in this block.
+            // Invalidate deferred inlines that could be stale due to side effects.
+            // Only function/method calls can mutate tables through side effects.
+            // Only Length (#t) operations are invalidated, not Index (t[k]) reads,
+            // because calls rarely affect specific field values of unrelated tables.
+            if block[i].has_side_effects() {
+                self.invalidate_stale_deferred_inlines(&block[i]);
+            }
 
             // Before recursing, apply any pending deferred inlines to the nested block(s).
             // This allows side-effect-free values from the parent scope to be inlined into
@@ -231,12 +236,12 @@ impl Inliner {
                             | RValue::Select(Select::MethodCall(_))
                     );
                 if is_iterator_call && assign.left.len() >= 1 {
-                    // Collect the local names being assigned
+                    // Collect the RcLocal objects being assigned (for identity matching)
                     let locals: Vec<_> = assign
                         .left
                         .iter()
                         .filter_map(|lv| lv.as_local())
-                        .filter_map(|l| l.name())
+                        .cloned()
                         .collect();
                     if locals.len() == assign.left.len() {
                         (true, locals)
@@ -262,9 +267,12 @@ impl Inliner {
                     // Check if this for-loop uses exactly our assigned locals
                     if generic_for.right.len() == assign_locals.len() {
                         let matches = generic_for.right.iter().zip(&assign_locals).all(
-                            |(rv, expected_name)| {
+                            |(rv, assign_local)| {
                                 if let RValue::Local(for_local) = rv {
-                                    for_local.name().as_ref() == Some(expected_name)
+                                    // Match by identity or by name (for SSA versions)
+                                    for_local == assign_local
+                                        || (for_local.name().is_some()
+                                            && for_local.name() == assign_local.name())
                                 } else {
                                     false
                                 }
@@ -280,9 +288,11 @@ impl Inliner {
                 // Only allow simple local assignments that don't reference our iterator locals
                 if let Statement::Assign(intervening) = &block[j] {
                     let reads_our_locals = intervening.right.iter().any(|rv| {
-                        rv.values_read()
-                            .iter()
-                            .any(|l| assign_locals.iter().any(|n| l.name().as_ref() == Some(n)))
+                        rv.values_read().iter().any(|l| {
+                            assign_locals.iter().any(|al| {
+                                *l == al || (l.name().is_some() && l.name() == al.name())
+                            })
+                        })
                     });
                     if reads_our_locals {
                         break; // Can't move past this
@@ -339,29 +349,13 @@ impl Inliner {
                         && assign.left.len() >= 1
                         && generic_for.right.len() == assign.left.len()
                     {
-                        // Check that all for-loop iterators are locals matching the assignment
-                        let mut matches = true;
-                        for (j, rv) in generic_for.right.iter().enumerate() {
-                            if let RValue::Local(for_local) = rv {
-                                if let LValue::Local(assign_local) = &assign.left[j] {
-                                    // Compare by identity OR by name for SSA versions
-                                    let same = for_local == assign_local
-                                        || (for_local.name().is_some()
-                                            && for_local.name() == assign_local.name());
-                                    if !same {
-                                        matches = false;
-                                        break;
-                                    }
-                                } else {
-                                    matches = false;
-                                    break;
-                                }
-                            } else {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        matches
+                        // Check that all for-loop iterators are locals (not other RValues).
+                        // We don't require name matching because SSA destruction can leave
+                        // the assignment LHS and for-loop iterator locals in different
+                        // congruence classes with different names. The adjacency of a
+                        // call-assignment and GenericFor with matching arity is sufficient
+                        // to identify this as the decomposed GenericForInit pattern.
+                        generic_for.right.iter().all(|rv| matches!(rv, RValue::Local(_)))
                     } else {
                         false
                     }
@@ -1249,6 +1243,24 @@ impl Inliner {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Invalidate deferred inlines containing Length (#t) operations when a
+    /// function/method call is encountered. Calls can mutate tables (e.g.,
+    /// table.insert), making deferred #t expressions stale.
+    ///
+    /// Index operations (t[k]) are NOT invalidated because calls rarely modify
+    /// specific field values of unrelated tables, and doing so causes many
+    /// false positives (e.g., `pixel[2]` dropped due to `math.deg()` call).
+    fn invalidate_stale_deferred_inlines(&mut self, statement: &Statement) {
+        if self.deferred_inlines.is_empty() {
+            return;
+        }
+
+        if statement_contains_call(statement) {
+            self.deferred_inlines
+                .retain(|_, rvalue| !references_mutable_state(rvalue));
         }
     }
 
@@ -5046,3 +5058,64 @@ fn inline_local_in_rvalue(rvalue: &mut RValue, local: &RcLocal, replacement: &RV
         inline_local_in_rvalue(rv, local, replacement);
     }
 }
+
+/// Check if an rvalue references mutable state that could be changed by a function call.
+/// This includes table field accesses (Index), length operations (Unary #), and
+/// method calls. Simple locals and literals are not mutable by external calls.
+/// Check if an rvalue references state that is sensitive to function calls.
+/// Only Length (#t) operations are considered mutable — they depend on the table's
+/// array length, which can change if elements are added/removed by a call.
+/// Index operations (t[k]) are NOT flagged because calls rarely modify specific
+/// field values of unrelated tables, and flagging them causes too many false positives.
+fn references_mutable_state(rvalue: &RValue) -> bool {
+    match rvalue {
+        // Table field access: NOT flagged. Writing t[k] = v in an assignment is handled
+        // separately. Calls that could change t[k] would need a reference to t, which
+        // is rare for deferred inline values (they're typically local table refs).
+        RValue::Index(idx) => {
+            // Recurse into sub-expressions (e.g., t[#arr] contains a Length)
+            references_mutable_state(&idx.left) || references_mutable_state(&idx.right)
+        }
+        // Length of a table like #self.fillTypes — could change if table is modified
+        RValue::Unary(unary) => {
+            if unary.operation == UnaryOperation::Length {
+                true
+            } else {
+                references_mutable_state(&unary.value)
+            }
+        }
+        RValue::Binary(binary) => {
+            references_mutable_state(&binary.left) || references_mutable_state(&binary.right)
+        }
+        // Locals, literals, closures are safe — they can't be changed by external calls
+        RValue::Local(_) | RValue::Literal(_) | RValue::Closure(_) => false,
+        // Calls have side effects and shouldn't be in deferred_inlines anyway
+        RValue::Call(_) | RValue::MethodCall(_) | RValue::Select(_) => true,
+        RValue::Table(table) => table.0.iter().any(|(k, v)| {
+            k.as_ref().map_or(false, references_mutable_state) || references_mutable_state(v)
+        }),
+        _ => false,
+    }
+}
+
+/// Check if a statement contains any Call or MethodCall in its RValues.
+/// This is used to distinguish function calls (which can mutate anything) from
+/// simple table field writes (which can only mutate one specific table).
+fn statement_contains_call(statement: &Statement) -> bool {
+    fn rvalue_contains_call(rvalue: &RValue) -> bool {
+        match rvalue {
+            RValue::Call(_) | RValue::MethodCall(_) | RValue::Select(_) => true,
+            _ => rvalue.rvalues().iter().any(|rv| rvalue_contains_call(rv)),
+        }
+    }
+
+    // Check direct call/method-call statements
+    match statement {
+        Statement::Call(_) | Statement::MethodCall(_) => return true,
+        _ => {}
+    }
+
+    // Check RValues within the statement (e.g. RHS of assignments)
+    statement.rvalues().iter().any(|rv| rvalue_contains_call(rv))
+}
+

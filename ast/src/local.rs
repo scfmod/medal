@@ -79,6 +79,11 @@ impl RcLocal {
             lock.0 = name;
         }
     }
+
+    /// Unconditionally set the name of this local
+    pub fn set_name(&self, name: Option<String>) {
+        self.0 .0.lock().0 = name;
+    }
 }
 
 impl LocalRw for RcLocal {
