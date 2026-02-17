@@ -61,6 +61,9 @@ impl super::GraphStructurer {
                     && self.function.entry() != &Some(node)
                     && !self.is_loop_header(node)
                 {
+                    if self.debug {
+                        eprintln!("[match_jump] removing no-op node {:?} -> target {:?}", node, target);
+                    }
                     for (source, edge) in self
                         .function
                         .graph()

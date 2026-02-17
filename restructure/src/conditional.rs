@@ -73,6 +73,13 @@ impl GraphStructurer {
         then_node: NodeIndex,
         else_node: NodeIndex,
     ) -> bool {
+        if self.debug {
+            let then_block = self.function.block(then_node);
+            let else_block = self.function.block(else_node);
+            eprintln!("[diamond] entry={:?} then={:?} else={:?}", entry, then_node, else_node);
+            eprintln!("  then_block len={}", then_block.map(|b| b.len()).unwrap_or(0));
+            eprintln!("  else_block len={}", else_block.map(|b| b.len()).unwrap_or(0));
+        }
         let mut then_successors = self.function.successor_blocks(then_node).collect_vec();
         let mut else_successors = self.function.successor_blocks(else_node).collect_vec();
 
@@ -204,6 +211,14 @@ impl GraphStructurer {
             }
 
             let then_block = self.function.remove_block(then_node).unwrap();
+
+            if self.debug {
+                eprintln!("[triangle] entry={:?} then={:?}(inv={}) else={:?} then_block_len={}",
+                    entry, then_node, inverted, else_node, then_block.len());
+                for (i, s) in then_block.iter().enumerate() {
+                    eprintln!("  then_block[{}]: {:?}", i, s);
+                }
+            }
 
             let block = self.function.block_mut(entry).unwrap();
             let if_stat = block.last_mut().unwrap().as_if_mut().unwrap();
