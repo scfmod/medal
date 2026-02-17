@@ -236,6 +236,13 @@ impl Function {
     /// The PC is used to find the correct scope when a register is reused
     /// for different variables in different scopes.
     pub fn get_debug_name_for_register(&self, register: u8, pc: usize) -> Option<usize> {
+        self.get_debug_info_for_register(register, pc)
+            .map(|info| info.name_index)
+    }
+
+    /// Find the debug info entry for this register at the given PC.
+    /// Returns the matching LocalDebugInfo with the narrowest scope.
+    pub fn get_debug_info_for_register(&self, register: u8, pc: usize) -> Option<&LocalDebugInfo> {
         // Find the debug info entry for this register that contains the current PC in its scope.
         // If multiple entries match (nested scopes), prefer the one with the narrowest scope
         // (largest scope_start that still contains pc).
@@ -252,6 +259,14 @@ impl Function {
                     && pc < info.scope_end
             })
             .max_by_key(|info| info.scope_start)
-            .map(|info| info.name_index)
+    }
+
+    /// Get a unique scope identifier for a register at a given PC.
+    /// Returns the scope_start of the matching debug info entry, or 0 if no scope matches.
+    /// Different source variables using the same register will have different scope_start values.
+    pub fn get_register_scope_id(&self, register: u8, pc: usize) -> usize {
+        self.get_debug_info_for_register(register, pc)
+            .map(|info| info.scope_start)
+            .unwrap_or(0)
     }
 }

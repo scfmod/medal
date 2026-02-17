@@ -240,6 +240,31 @@ pub fn apply_local_map(function: &mut Function, local_map: FxHashMap<RcLocal, Rc
 
 // based on "Simple and Efficient Construction of Static Single Assignment Form" (https://pp.info.uni-karlsruhe.de/uploads/publikationen/braun13cc.pdf)
 impl<'a> SsaConstructor<'a> {
+    /// Create a new SSA local with the correct debug name for this definition point.
+    /// Uses PC-aware scope lookup to find the right name for this register at this location,
+    /// instead of blindly copying the pre-SSA local's name (which may be wrong when
+    /// registers are reused for different source variables).
+    fn new_ssa_local(&self, local: &RcLocal, node: NodeIndex, stat_index: usize) -> RcLocal {
+        // Only use debug info lookup if we have debug info available.
+        // If no debug info exists (stripped bytecode), fall back to clone_with_name.
+        if !self.function.register_debug_info.is_empty() {
+            let name = self.function.get_local_debug_name(local, node, stat_index);
+            if name.is_some() {
+                RcLocal::new(ast::Local::new(name))
+            } else if self.function.parameters.contains(local) {
+                // Parameters don't have statement PCs — preserve their lifter name.
+                RcLocal::clone_with_name(local)
+            } else {
+                // Debug info lookup failed for a non-parameter local.
+                // Create unnamed to avoid propagating a stale name from a
+                // different scope that happens to share the same register.
+                RcLocal::new(ast::Local::new(None))
+            }
+        } else {
+            RcLocal::clone_with_name(local)
+        }
+    }
+
     fn write_local(&mut self, node: NodeIndex, local: &RcLocal, new_local: &RcLocal) {
         self.all_definitions
             .entry(local.clone())
@@ -362,9 +387,8 @@ impl<'a> SsaConstructor<'a> {
         } else {
             // search globally
             if !self.sealed_blocks.contains(&node) {
-                // TODO: this code is repeated multiple times, create new_local function
-                // Preserve debug name from original local
-                let param_local = RcLocal::clone_with_name(local);
+                // Phi param at block entry — use node's start PC for scope lookup
+                let param_local = self.new_ssa_local(local, node, 0);
                 self.old_locals.insert(param_local.clone(), local.clone());
                 if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                     upvalues.insert(param_local.clone());
@@ -378,8 +402,8 @@ impl<'a> SsaConstructor<'a> {
             } else if let Ok(pred) = self.function.predecessor_blocks(node).exactly_one() {
                 self.find_local(pred, local)
             } else {
-                // Preserve debug name from original local
-                let param_local = RcLocal::clone_with_name(local);
+                // Phi param at merge point — use node's start PC for scope lookup
+                let param_local = self.new_ssa_local(local, node, 0);
                 self.old_locals.insert(param_local.clone(), local.clone());
                 if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                     upvalues.insert(param_local.clone());
@@ -537,8 +561,8 @@ impl<'a> SsaConstructor<'a> {
                     && let Some(local) = assign.left[0].as_local().cloned()
                     && assign.right[0].as_closure().is_some()
                 {
-                    // Preserve debug name from original local
-                    let new_local = RcLocal::clone_with_name(&local);
+                    // Closure assignment — use PC-aware debug name lookup
+                    let new_local = self.new_ssa_local(&local, node, stat_index);
                     self.old_locals.insert(new_local.clone(), local.clone());
                     if let Some(upvalues) = self.new_upvalues_in.get_mut(&local) {
                         upvalues.insert(new_local.clone());
@@ -564,8 +588,8 @@ impl<'a> SsaConstructor<'a> {
                     self.read(node, stat_index);
                     // write
                     for (local_index, local) in written.iter().enumerate() {
-                        // Preserve debug name from original local
-                        let new_local = RcLocal::clone_with_name(local);
+                        // Use PC-aware debug name lookup for correct scope
+                        let new_local = self.new_ssa_local(local, node, stat_index);
                         self.old_locals.insert(new_local.clone(), local.clone());
                         if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                             upvalues.insert(new_local.clone());
