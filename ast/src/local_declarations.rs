@@ -176,9 +176,30 @@ impl LocalDeclarer {
                 .insert(local);
         }
 
-        for (ByAddress(block), declarations) in self.declarations {
+        for (ByAddress(block), mut declarations) in self.declarations {
+            // After SSA destruction, multiple RcLocal instances can share the same
+            // name (different SSA versions of the same source variable). Only the
+            // first (lowest stat_index) should get a `local` prefix. Filter out
+            // duplicates in a forward pass before applying.
+            let mut declared_names: FxHashSet<String> = FxHashSet::default();
+            // BTreeMap iterates in ascending key order (lowest stat_index first)
+            for (_stat_index, locals) in declarations.iter_mut() {
+                locals.retain(|l| {
+                    if let Some(name) = l.name() {
+                        if declared_names.contains(&name) {
+                            return false;
+                        }
+                        declared_names.insert(name);
+                    }
+                    true
+                });
+            }
+
             let mut block = block.lock();
             for (stat_index, mut locals) in declarations.into_iter().rev() {
+                if locals.is_empty() {
+                    continue;
+                }
                 match &mut block[stat_index] {
                     Statement::Assign(assign)
                         if assign

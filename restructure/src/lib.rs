@@ -34,6 +34,7 @@ struct GraphStructurer {
     pub function: Function,
     loop_headers: FxHashSet<NodeIndex>,
     label_to_node: FxHashMap<ast::Label, NodeIndex>,
+    debug: bool,
 }
 
 impl GraphStructurer {
@@ -50,10 +51,15 @@ impl GraphStructurer {
         );
     }
     fn new(function: Function) -> Self {
+        let debug = std::env::var("DEBUG_RESTRUCTURE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(false, |id| id == function.id);
         let mut this = Self {
             function,
             loop_headers: FxHashSet::default(),
             label_to_node: FxHashMap::default(),
+            debug,
         };
         this.find_loop_headers();
         this

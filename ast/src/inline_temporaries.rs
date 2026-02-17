@@ -27,19 +27,59 @@ const MAX_DEPTH: usize = 100;
 ///   for k, v in pairs(x) do
 pub fn inline_temporaries(block: &mut Block) {
     let mut inliner = Inliner::default();
+    if inliner.debug {
+        eprintln!("=== BEFORE inline_temporaries ===");
+        dump_block_recursive(block, 0);
+    }
     inliner.inline_block(block, 0, &FxHashSet::default());
+    if inliner.debug {
+        eprintln!("=== AFTER inline_block ===");
+        dump_block_recursive(block, 0);
+    }
     // Remove dead stores (self-assignments, round-trip assignments) after inlining
     remove_dead_stores(block);
+    if inliner.debug {
+        eprintln!("=== AFTER remove_dead_stores ===");
+        dump_block_recursive(block, 0);
+    }
     // Remove dead locals (assigned but never read)
     remove_dead_locals(block);
+    if inliner.debug {
+        eprintln!("=== AFTER remove_dead_locals ===");
+        dump_block_recursive(block, 0);
+    }
 }
 
-#[derive(Default)]
+fn dump_block_recursive(block: &Block, indent: usize) {
+    let prefix = "  ".repeat(indent);
+    for (i, stmt) in block.iter().enumerate() {
+        if let Statement::If(if_stat) = stmt {
+            eprintln!("{}[{}] if ... then ({} stmts) else ({} stmts)",
+                prefix, i, if_stat.then_block.lock().len(), if_stat.else_block.lock().len());
+            dump_block_recursive(&if_stat.then_block.lock(), indent + 1);
+        } else {
+            let s = format!("{:?}", stmt);
+            eprintln!("{}[{}] {}", prefix, i, &s[..s.len().min(120)]);
+        }
+    }
+}
+
 struct Inliner {
     // Map from local to RValue for deferred inlining (side-effect-free only)
     deferred_inlines: FxHashMap<RcLocal, RValue>,
     // Locals that should be inlined into the immediate next statement only
     immediate_inlines: FxHashMap<RcLocal, RValue>,
+    debug: bool,
+}
+
+impl Default for Inliner {
+    fn default() -> Self {
+        Self {
+            deferred_inlines: FxHashMap::default(),
+            immediate_inlines: FxHashMap::default(),
+            debug: std::env::var("DEBUG_INLINE").is_ok(),
+        }
+    }
 }
 
 impl Inliner {
@@ -96,6 +136,9 @@ impl Inliner {
                         .any(|c| c.name().is_some() && c.name() == local.name());
 
                 if is_candidate {
+                    if self.debug {
+                        eprintln!("[candidate] {} = {:?} side_effects={}", local, rvalue, has_side_effects(&rvalue));
+                    }
                     if has_side_effects(&rvalue) {
                         // Must inline carefully for side-effect RValues.
                         // We can inline if:
@@ -112,6 +155,9 @@ impl Inliner {
                         }
                     } else {
                         // Can defer inlining - add to deferred map
+                        if self.debug {
+                            eprintln!("[defer] {} = {:?}", local, rvalue);
+                        }
                         self.deferred_inlines.insert(local.clone(), rvalue);
                         block.0.remove(i);
                         continue;
@@ -125,6 +171,48 @@ impl Inliner {
             // because calls rarely affect specific field values of unrelated tables.
             if block[i].has_side_effects() {
                 self.invalidate_stale_deferred_inlines(&block[i]);
+            }
+
+            // Invalidate deferred inlines whose rvalue references a local that is
+            // written by this statement. This prevents incorrect inlining across
+            // assignments that modify the source variable. Example swap pattern:
+            //   v1 = minVal     → deferred: v1 → minVal
+            //   minVal = maxVal → MUST invalidate v1's deferred inline (minVal changed)
+            //   maxVal = v1     → without invalidation, would become maxVal = minVal (WRONG)
+            // When invalidated, re-insert the definition statement so the temp is preserved.
+            if !self.deferred_inlines.is_empty() {
+                let written_locals: Vec<RcLocal> = block[i]
+                    .values_written()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if !written_locals.is_empty() {
+                    let mut to_restore: Vec<(RcLocal, RValue)> = Vec::new();
+                    self.deferred_inlines.retain(|local, rvalue| {
+                        let stale = rvalue.values_read().iter().any(|read_local| {
+                            written_locals.iter().any(|written| {
+                                written == *read_local
+                                    || (written.name().is_some()
+                                        && written.name() == read_local.name())
+                            })
+                        });
+                        if stale {
+                            to_restore.push((local.clone(), rvalue.clone()));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    // Re-insert invalidated definitions before the current statement
+                    for (local, rvalue) in to_restore.into_iter().rev() {
+                        if self.debug {
+                            eprintln!("[restore] {} = {:?} (before stmt {})", local, rvalue, i);
+                        }
+                        let assign = Assign::new(vec![local.into()], vec![rvalue]);
+                        block.0.insert(i, assign.into());
+                        i += 1; // shift current index to account for insertion
+                    }
+                }
             }
 
             // Before recursing, apply any pending deferred inlines to the nested block(s).
@@ -744,6 +832,16 @@ impl Inliner {
                 let is_unnamed = local.name().map_or(true, |n| is_unnamed_temporary(&n));
                 if is_unnamed {
                     return true;
+                }
+
+                // Don't inline named locals that are also READ in the same block.
+                // This prevents destruction of value-moving patterns (swaps, rotations)
+                // where a named local is both assigned and read at the same block level.
+                // Example: `v1=minVal; minVal=maxVal; maxVal=v1` — minVal and maxVal are
+                // each defined once and used once in this block, but inlining them would
+                // destroy the swap semantics.
+                if current_uses > 0 {
+                    return false;
                 }
 
                 // For named locals, only inline side-effect-free values
@@ -3256,25 +3354,41 @@ fn remove_dead_locals_in_closures(rvalue: &mut RValue, dead_locals: &FxHashSet<R
 /// ```
 fn fix_broken_swap_patterns(block: &mut Block) {
     let mut i = 0;
-    while i + 3 < block.len() {
-        // Check for the 4-statement broken swap pattern
-        if let Some((var_a, var_b)) = detect_broken_swap(&block[i..i + 4]) {
-            // Remove statements 1, 2, 3 (keeping index i for the swap)
-            block.0.remove(i + 3);
+    while i + 2 < block.len() {
+        // Check for the correct 3-statement swap pattern:
+        // temp = a; a = b; b = temp  →  a, b = b, a
+        if let Some((var_a, var_b)) = detect_correct_swap(&block[i..i + 3]) {
             block.0.remove(i + 2);
             block.0.remove(i + 1);
 
-            // Replace statement 0 with the multi-assignment swap
-            // For: temp = a; a = b; temp = b; b = a
-            // We want: a, b = b, a
             let swap_assign = Assign::new(
                 vec![var_a.clone().into(), var_b.clone().into()],
                 vec![RValue::Local(var_b.clone()), RValue::Local(var_a.clone())],
             );
             block[i] = swap_assign.into();
-
-            // Don't increment - check from same position in case there are more
             continue;
+        }
+
+        // Check for the 4-statement broken swap pattern
+        if i + 3 < block.len() {
+            if let Some((var_a, var_b)) = detect_broken_swap(&block[i..i + 4]) {
+                // Remove statements 1, 2, 3 (keeping index i for the swap)
+                block.0.remove(i + 3);
+                block.0.remove(i + 2);
+                block.0.remove(i + 1);
+
+                // Replace statement 0 with the multi-assignment swap
+                // For: temp = a; a = b; temp = b; b = a
+                // We want: a, b = b, a
+                let swap_assign = Assign::new(
+                    vec![var_a.clone().into(), var_b.clone().into()],
+                    vec![RValue::Local(var_b.clone()), RValue::Local(var_a.clone())],
+                );
+                block[i] = swap_assign.into();
+
+                // Don't increment - check from same position in case there are more
+                continue;
+            }
         }
 
         i += 1;
@@ -3389,6 +3503,54 @@ fn detect_broken_swap(stmts: &[Statement]) -> Option<(RcLocal, RcLocal)> {
     }
     // stmt3_right should be var_a (the now-corrupted value) or temp
     if !locals_equal(stmt3_right, var_a) && !locals_equal(stmt3_right, temp) {
+        return None;
+    }
+
+    Some((var_a.clone(), var_b.clone()))
+}
+
+/// Detect a correct 3-statement swap pattern:
+///   temp = a; a = b; b = temp
+/// where temp is an unnamed temporary.
+/// Returns Some((a, b)) if the pattern matches.
+fn detect_correct_swap(stmts: &[Statement]) -> Option<(RcLocal, RcLocal)> {
+    if stmts.len() < 3 {
+        return None;
+    }
+
+    // stmt[0]: temp = a
+    let stmt0 = stmts[0].as_assign()?;
+    if stmt0.left.len() != 1 || stmt0.right.len() != 1 {
+        return None;
+    }
+    let temp = stmt0.left[0].as_local()?;
+    if !temp.name().map_or(true, |n| is_unnamed_temporary(&n)) {
+        return None;
+    }
+    let var_a = stmt0.right[0].as_local()?;
+
+    // stmt[1]: a = b
+    let stmt1 = stmts[1].as_assign()?;
+    if stmt1.left.len() != 1 || stmt1.right.len() != 1 {
+        return None;
+    }
+    let stmt1_left = stmt1.left[0].as_local()?;
+    let var_b = stmt1.right[0].as_local()?;
+    if !locals_equal(stmt1_left, var_a) {
+        return None;
+    }
+
+    // stmt[2]: b = temp
+    let stmt2 = stmts[2].as_assign()?;
+    if stmt2.left.len() != 1 || stmt2.right.len() != 1 {
+        return None;
+    }
+    let stmt2_left = stmt2.left[0].as_local()?;
+    let stmt2_right = stmt2.right[0].as_local()?;
+    if !locals_equal(stmt2_left, var_b) {
+        return None;
+    }
+    if !locals_equal(stmt2_right, temp) {
         return None;
     }
 
