@@ -11,11 +11,28 @@ use petgraph::{
 
 use crate::function::Function;
 
+fn local_id(local: &ast::RcLocal) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    local.hash(&mut hasher);
+    format!("{}@{:04x}", local, hasher.finish() & 0xFFFF)
+}
+
 fn arguments(args: &Vec<(ast::RcLocal, ast::RValue)>) -> String {
     let mut s = String::new();
+    let use_ids = std::env::var("DOT_LOCAL_IDS").is_ok();
     for (i, (local, new_local)) in args.iter().enumerate() {
         use std::fmt::Write;
-        write!(s, "{} -> {}", local, new_local).unwrap();
+        if use_ids {
+            let arg_id = if let Some(arg_local) = new_local.as_local() {
+                local_id(arg_local)
+            } else {
+                format!("{}", new_local)
+            };
+            write!(s, "{} -> {}", local_id(local), arg_id).unwrap();
+        } else {
+            write!(s, "{} -> {}", local, new_local).unwrap();
+        }
         if i + 1 != args.len() {
             s.push('\n');
         }

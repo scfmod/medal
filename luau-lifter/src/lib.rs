@@ -212,8 +212,20 @@ fn decompile_function(
     mut function: Function,
     upvalues_in: Vec<ast::RcLocal>,
 ) -> (ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>) {
+    let dump_cfg = std::env::var("DUMP_CFG_FUNC").ok().map(|s| s.parse::<usize>().unwrap_or(usize::MAX));
+
+    if dump_cfg == Some(function.id) {
+        eprintln!("=== BEFORE SSA (func {}) ===", function.id);
+        cfg::dot::render_to(&function, &mut std::io::stderr()).ok();
+    }
+
     let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
         cfg::ssa::construct(&mut function, &upvalues_in);
+
+    if dump_cfg == Some(function.id) {
+        eprintln!("=== AFTER SSA (func {}) ===", function.id);
+        cfg::dot::render_to(&function, &mut std::io::stderr()).ok();
+    }
     // Collect upvalues coming IN (from parent) - these will be ignored for declaration
     let upvalue_in_locals: FxHashSet<ast::RcLocal> = upvalue_in_groups
         .iter()
@@ -269,9 +281,19 @@ fn decompile_function(
 
         ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
+        if dump_cfg == Some(function.id) {
+            eprintln!("=== AFTER INLINE iter={} (func {}) ===", iteration, function.id);
+            cfg::dot::render_to(&function, &mut std::io::stderr()).ok();
+        }
+
         if structure_conditionals(&mut function) {
             changed = true;
             dominators_valid = false; // CFG changed, invalidate dominators
+        }
+
+        if dump_cfg == Some(function.id) {
+            eprintln!("=== AFTER STRUCTURE_COND iter={} (func {}) ===", iteration, function.id);
+            cfg::dot::render_to(&function, &mut std::io::stderr()).ok();
         }
 
         // Structure or-chains: multiple conditions jumping to same target
@@ -286,6 +308,11 @@ fn decompile_function(
             changed = true;
         }
         ssa::construct::apply_local_map(&mut function, local_map);
+
+        if dump_cfg == Some(function.id) {
+            eprintln!("=== AFTER REMOVE_PARAMS iter={} (func {}) ===", iteration, function.id);
+            cfg::dot::render_to(&function, &mut std::io::stderr()).ok();
+        }
     }
     // Build set of locals to ignore for declaration: upvalues_in, params, and all their SSA versions
     // This ensures that when a parameter is reassigned (creating a new SSA version), we don't
@@ -330,6 +357,11 @@ fn decompile_function(
         local_count,
     )
     .destruct();
+
+    if dump_cfg == Some(function.id) {
+        eprintln!("=== AFTER SSA DESTRUCT (func {}) ===", function.id);
+        cfg::dot::render_to(&function, &mut std::io::stderr()).ok();
+    }
 
     let params = std::mem::take(&mut function.parameters);
     let is_variadic = function.is_variadic;

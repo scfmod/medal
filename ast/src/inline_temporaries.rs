@@ -677,6 +677,19 @@ impl Inliner {
                     return false;
                 }
 
+                // Never inline self-referential assignments like `x = x + 1` or `s = s .. "text"`
+                // The single "use" is within the definition's own RHS, not an independent use
+                // elsewhere. Inlining would remove the statement with nowhere to put the value.
+                if let Some(rv) = rvalue {
+                    let rhs_reads_self = rv.values_read().iter().any(|r| {
+                        *r == local
+                            || (r.name().is_some() && r.name() == local.name())
+                    });
+                    if rhs_reads_self {
+                        return false;
+                    }
+                }
+
                 // Never inline locals used in loop conditions (current block)
                 if loop_condition_locals.contains(local) {
                     return false;

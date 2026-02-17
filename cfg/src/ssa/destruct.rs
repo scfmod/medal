@@ -247,6 +247,7 @@ impl<'a> Destructor<'a> {
             if con_class.is_empty() {
                 continue;
             }
+
             // Prefer a local with a meaningful debug name (not "_") if any exists.
             // Fall back to any named local, then to the first by dominator order.
             let new_local = con_class
