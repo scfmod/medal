@@ -547,8 +547,8 @@ impl Inliner {
         // Track locals WRITTEN in nested blocks - these must never be inlined
         // because the value changes inside the nested block
         let mut nested_block_writes: FxHashSet<RcLocal> = FxHashSet::default();
-        // Track locals READ in nested blocks - these are uses but can't be inlined via deferred_inlines
-        let mut nested_block_reads: FxHashSet<RcLocal> = FxHashSet::default();
+        // Track locals READ in nested blocks with actual use counts
+        let mut nested_block_read_counts: FxHashMap<RcLocal, usize> = FxHashMap::default();
         // Track locals captured as upvalues by closures - these must NEVER be inlined
         // because closures capture the local reference, not just its value
         let mut upvalue_captured: FxHashSet<RcLocal> = FxHashSet::default();
@@ -572,7 +572,7 @@ impl Inliner {
                         loop_condition_locals.insert(local.clone());
                     }
                     // Track reads, writes, and upvalue captures separately
-                    Self::collect_reads_in_block_set(&w.block.lock(), &mut nested_block_reads);
+                    Self::collect_reads_in_block_counts(&w.block.lock(), &mut nested_block_read_counts);
                     Self::collect_writes_in_block(&w.block.lock(), &mut nested_block_writes);
                     Self::collect_upvalue_captures_in_block(&w.block.lock(), &mut upvalue_captured);
                 }
@@ -580,14 +580,14 @@ impl Inliner {
                     for local in r.condition.values_read() {
                         loop_condition_locals.insert(local.clone());
                     }
-                    Self::collect_reads_in_block_set(&r.block.lock(), &mut nested_block_reads);
+                    Self::collect_reads_in_block_counts(&r.block.lock(), &mut nested_block_read_counts);
                     Self::collect_writes_in_block(&r.block.lock(), &mut nested_block_writes);
                     Self::collect_upvalue_captures_in_block(&r.block.lock(), &mut upvalue_captured);
                 }
                 Statement::If(i) => {
                     // Track reads, writes, and upvalue captures in if/else bodies
-                    Self::collect_reads_in_block_set(&i.then_block.lock(), &mut nested_block_reads);
-                    Self::collect_reads_in_block_set(&i.else_block.lock(), &mut nested_block_reads);
+                    Self::collect_reads_in_block_counts(&i.then_block.lock(), &mut nested_block_read_counts);
+                    Self::collect_reads_in_block_counts(&i.else_block.lock(), &mut nested_block_read_counts);
                     Self::collect_writes_in_block(&i.then_block.lock(), &mut nested_block_writes);
                     Self::collect_writes_in_block(&i.else_block.lock(), &mut nested_block_writes);
                     Self::collect_upvalue_captures_in_block(
@@ -600,7 +600,7 @@ impl Inliner {
                     );
                 }
                 Statement::NumericFor(nf) => {
-                    Self::collect_reads_in_block_set(&nf.block.lock(), &mut nested_block_reads);
+                    Self::collect_reads_in_block_counts(&nf.block.lock(), &mut nested_block_read_counts);
                     Self::collect_writes_in_block(&nf.block.lock(), &mut nested_block_writes);
                     Self::collect_upvalue_captures_in_block(
                         &nf.block.lock(),
@@ -608,7 +608,7 @@ impl Inliner {
                     );
                 }
                 Statement::GenericFor(gf) => {
-                    Self::collect_reads_in_block_set(&gf.block.lock(), &mut nested_block_reads);
+                    Self::collect_reads_in_block_counts(&gf.block.lock(), &mut nested_block_read_counts);
                     Self::collect_writes_in_block(&gf.block.lock(), &mut nested_block_writes);
                     Self::collect_upvalue_captures_in_block(
                         &gf.block.lock(),
@@ -661,16 +661,20 @@ impl Inliner {
                         })
                     })
                     .unwrap_or(0);
-                // Check if local is read in nested blocks (by identity or by name for SSA versions)
-                let nested_uses = if nested_block_reads.contains(local)
-                    || nested_block_reads
-                        .iter()
-                        .any(|l| l.name().is_some() && l.name() == local.name())
-                {
-                    1
-                } else {
-                    0
-                };
+                // Count actual reads in nested blocks (by identity or by name for SSA versions)
+                let nested_uses = nested_block_read_counts
+                    .get(local)
+                    .copied()
+                    .unwrap_or(0)
+                    + local.name().map_or(0, |name| {
+                        nested_block_read_counts
+                            .iter()
+                            .filter(|(l, _)| {
+                                *l != local && l.name().as_ref() == Some(&name)
+                            })
+                            .map(|(_, &count)| count)
+                            .sum::<usize>()
+                    });
                 let total_uses = current_uses + nested_uses;
 
                 if *def_count != 1 || total_uses != 1 {
@@ -777,6 +781,34 @@ impl Inliner {
                 }
                 Statement::GenericFor(gf) => {
                     Self::collect_reads_in_block_set(&gf.block.lock(), reads);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect all locals READ in a block (recursively) with actual use counts.
+    fn collect_reads_in_block_counts(block: &Block, counts: &mut FxHashMap<RcLocal, usize>) {
+        for statement in &block.0 {
+            for local in statement.values_read() {
+                *counts.entry(local.clone()).or_default() += 1;
+            }
+            match statement {
+                Statement::If(i) => {
+                    Self::collect_reads_in_block_counts(&i.then_block.lock(), counts);
+                    Self::collect_reads_in_block_counts(&i.else_block.lock(), counts);
+                }
+                Statement::While(w) => {
+                    Self::collect_reads_in_block_counts(&w.block.lock(), counts);
+                }
+                Statement::Repeat(r) => {
+                    Self::collect_reads_in_block_counts(&r.block.lock(), counts);
+                }
+                Statement::NumericFor(nf) => {
+                    Self::collect_reads_in_block_counts(&nf.block.lock(), counts);
+                }
+                Statement::GenericFor(gf) => {
+                    Self::collect_reads_in_block_counts(&gf.block.lock(), counts);
                 }
                 _ => {}
             }
@@ -4940,6 +4972,24 @@ fn collapse_table_field_assignments(block: &mut Block) {
 
         // Now look for the final use: target = v, or call(v), or obj:method(v)
         if j >= block.len() {
+            i += 1;
+            continue;
+        }
+
+        // Before collapsing, verify the local is not used AFTER the final use (j).
+        // If it has additional references, collapsing would remove the definition
+        // while leaving dangling references.
+        let has_later_uses = {
+            let mut found = false;
+            for k in (j + 1)..block.len() {
+                if refs_local(&block[k]) {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if has_later_uses {
             i += 1;
             continue;
         }
