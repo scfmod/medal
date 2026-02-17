@@ -176,12 +176,54 @@ impl LocalDeclarer {
                 .insert(local);
         }
 
+        // Build a map: node → { name → earliest stat_index of declaration }.
+        let mut node_declared_at: FxHashMap<NodeIndex, FxHashMap<String, usize>> =
+            FxHashMap::default();
+        for (ByAddress(block), declarations) in &self.declarations {
+            let node = self.block_to_node[&ByAddress(block.clone())];
+            let map = node_declared_at.entry(node).or_default();
+            for (&stat_index, locals) in declarations {
+                for local in locals {
+                    if let Some(name) = local.name() {
+                        map.entry(name)
+                            .and_modify(|idx| *idx = (*idx).min(stat_index))
+                            .or_insert(stat_index);
+                    }
+                }
+            }
+        }
+
         for (ByAddress(block), mut declarations) in self.declarations {
+            // Collect names already declared in ancestor scopes, but only if the
+            // ancestor declaration is at or before the statement where the child
+            // block is attached.  This prevents suppressing a declaration when the
+            // ancestor's `local` actually comes AFTER the child block.
+            let node = self.block_to_node[&ByAddress(block.clone())];
+            let mut ancestor_names: FxHashSet<String> = FxHashSet::default();
+            let mut current = node;
+            while let Some(parent) = self
+                .graph
+                .neighbors_directed(current, Direction::Incoming)
+                .next()
+            {
+                // stat_index stored in the current node is where this child
+                // block sits relative to its parent.
+                let child_stat_index = self.graph.node_weight(current).unwrap().1;
+                if let Some(decls) = node_declared_at.get(&parent) {
+                    for (name, &decl_idx) in decls {
+                        if decl_idx <= child_stat_index {
+                            ancestor_names.insert(name.clone());
+                        }
+                    }
+                }
+                current = parent;
+            }
+
             // After SSA destruction, multiple RcLocal instances can share the same
             // name (different SSA versions of the same source variable). Only the
             // first (lowest stat_index) should get a `local` prefix. Filter out
-            // duplicates in a forward pass before applying.
-            let mut declared_names: FxHashSet<String> = FxHashSet::default();
+            // duplicates within this block AND against ancestor scopes.
+            let mut declared_names: FxHashSet<String> = ancestor_names;
             // BTreeMap iterates in ascending key order (lowest stat_index first)
             for (_stat_index, locals) in declarations.iter_mut() {
                 locals.retain(|l| {
