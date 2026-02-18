@@ -78,19 +78,40 @@ impl Function {
     /// with a small scope extension to handle Luau's scope_start offset.
     pub fn get_local_debug_name(&self, local: &RcLocal, node: NodeIndex, stat_index: usize) -> Option<String> {
         let register = self.local_to_register.get(local)?;
-        let pc = self.statement_pc.get(&(node, stat_index)).copied()?;
+        let pc = self.statement_pc.get(&(node, stat_index)).copied()
+            .or_else(|| {
+                // Phi params at block entry (stat_index=0) don't have statement PCs.
+                // Use the first available PC in this block as an approximation.
+                self.statement_pc.iter()
+                    .filter(|((n, _), _)| *n == node)
+                    .min_by_key(|((_, si), _)| *si)
+                    .map(|(_, &pc)| pc)
+            })?;
         let name = self.get_debug_name_for_register(*register, pc)
             .or_else(|| {
-                // Fallback: if the register has exactly one unique name across all scopes,
-                // use it. This handles cases where the definition PC falls before the
-                // debug scope_start (common with Luau's compiler debug info).
-                let names: rustc_hash::FxHashSet<&str> = self.register_debug_info
+                let entries: Vec<_> = self.register_debug_info
                     .iter()
                     .filter(|info| info.register == *register && !info.name.starts_with('('))
-                    .map(|info| info.name.as_str())
                     .collect();
+                let names: rustc_hash::FxHashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
                 if names.len() == 1 {
-                    Some(*names.iter().next().unwrap())
+                    // Only one name for this register — use it regardless of scope.
+                    Some(entries[0].name.as_str())
+                } else if names.len() > 1 {
+                    // Multiple names for this register (reused across scopes).
+                    // Try two strategies:
+                    // 1. Find nearest scope starting soon after our PC (assignment
+                    //    just before scope_start — up to 10 instructions gap).
+                    // 2. Find most recently ended scope before our PC.
+                    entries.iter()
+                        .filter(|info| info.scope_start > pc && info.scope_start <= pc + 10)
+                        .min_by_key(|info| info.scope_start)
+                        .or_else(|| {
+                            entries.iter()
+                                .filter(|info| info.scope_end <= pc + 5)
+                                .max_by_key(|info| info.scope_end)
+                        })
+                        .map(|info| info.name.as_str())
                 } else {
                     None
                 }

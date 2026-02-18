@@ -449,13 +449,14 @@ impl<'a> SsaConstructor<'a> {
                         let from_has_name = from.name().is_some();
                         let to_has_name = to.name().is_some();
 
-                        // When both locals have debug names AND originate from
-                        // different registers, they represent genuinely different
-                        // source variables.  Do not merge them — keep the copy.
-                        // Example: `profileClass = string.lower(profileClass)` stores
-                        // the result in R0 while `currentProfileIndex` lives in R1.
-                        // Merging would make all R0 uses show as `currentProfileIndex`.
-                        if from_has_name && to_has_name && from_old != to_old {
+                        // When both locals have debug names, do not merge if:
+                        // 1. They come from different registers (genuinely different
+                        //    source variables), OR
+                        // 2. They have different names (same register reused for
+                        //    different variables in different scopes).
+                        if from_has_name && to_has_name
+                            && (from_old != to_old || from.name() != to.name())
+                        {
                             // Keep both variables; do not eliminate the copy.
                         } else if from_has_name && !to_has_name {
                             // from has name, to doesn't -> keep from, map to → from
