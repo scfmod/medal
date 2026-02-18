@@ -3278,21 +3278,36 @@ fn collect_local_usage_in_rvalue(
     }
 }
 
+fn is_dead_local(local: &RcLocal, dead_locals: &FxHashSet<RcLocal>) -> bool {
+    dead_locals.contains(local)
+        || dead_locals
+            .iter()
+            .any(|d| d.name().is_some() && d.name() == local.name())
+}
+
 fn remove_dead_local_assignments(block: &mut Block, dead_locals: &FxHashSet<RcLocal>) {
     // Remove assignments to dead locals
-    block.retain(|stmt| {
-        if let Some(assign) = stmt.as_assign() {
-            // Check if this assignment ONLY writes to dead locals
-            // and the RHS has no side effects
-            if assign.left.len() == 1 && !assign.right.iter().any(|r| r.has_side_effects()) {
-                if let Some(local) = assign.left[0].as_local() {
-                    let is_dead = dead_locals.contains(local)
-                        || dead_locals
-                            .iter()
-                            .any(|d| d.name().is_some() && d.name() == local.name());
-                    if is_dead {
-                        return false; // Remove this statement
-                    }
+    block.retain_mut(|stmt| {
+        if let Statement::Assign(assign) = stmt {
+            // Check if ALL LHS lvalues are dead locals and RHS has no side effects
+            let all_dead = !assign.left.is_empty()
+                && assign.left.iter().all(|lv| {
+                    lv.as_local().map_or(false, |l| is_dead_local(l, dead_locals))
+                })
+                && !assign.right.iter().any(|r| r.has_side_effects());
+            if all_dead {
+                return false; // Remove entire statement
+            }
+
+            // For bare declarations (prefix=true, empty RHS), remove dead locals
+            // from the LHS while keeping live ones
+            if assign.prefix && assign.right.is_empty() && assign.left.len() > 1 {
+                assign.left.retain(|lv| {
+                    lv.as_local()
+                        .map_or(true, |l| !is_dead_local(l, dead_locals))
+                });
+                if assign.left.is_empty() {
+                    return false; // All locals were dead
                 }
             }
         }

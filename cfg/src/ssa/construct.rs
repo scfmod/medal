@@ -446,20 +446,28 @@ impl<'a> SsaConstructor<'a> {
                     if !self.new_upvalues_in.contains_key(to_old)
                         && !self.upvalues_passed.contains_key(to_old)
                     {
-                        // Prefer keeping the variable with a debug name.
-                        // If `from` has a name and `to` doesn't, map `to → from`
-                        // so the named variable is preserved in the output.
                         let from_has_name = from.name().is_some();
                         let to_has_name = to.name().is_some();
-                        if from_has_name && !to_has_name {
+
+                        // When both locals have debug names, do not merge if:
+                        // 1. They come from different registers (genuinely different
+                        //    source variables), OR
+                        // 2. They have different names (same register reused for
+                        //    different variables in different scopes).
+                        if from_has_name && to_has_name
+                            && (from_old != to_old || from.name() != to.name())
+                        {
+                            // Keep both variables; do not eliminate the copy.
+                        } else if from_has_name && !to_has_name {
                             // from has name, to doesn't -> keep from, map to → from
                             self.local_map.insert(to.clone(), from.clone());
+                            block[index] = ast::Empty {}.into();
                         } else {
-                            // Either: to has name, or neither has name, or both have names
-                            // -> keep to (original behavior)
+                            // Either: to has name, or neither has name, or both
+                            // have names from the same register -> keep to
                             self.local_map.insert(from.clone(), to.clone());
+                            block[index] = ast::Empty {}.into();
                         }
-                        block[index] = ast::Empty {}.into();
                     }
                 }
             }

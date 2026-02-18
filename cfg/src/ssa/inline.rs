@@ -527,27 +527,25 @@ pub fn inline(
         }
     }
 
-    // Collect all locals involved in for loop constructs - these should not be inlined
-    // to preserve the link between NumForInit/NumForNext and the loop body.
+    // Collect locals *written* by for loop constructs — these are internal
+    // control variables that must not be inlined away.  Locals that are only
+    // *read* (the init/limit/step expressions) should remain inlineable so
+    // that `local i = #t; for i = i, 1, -1` becomes `for i = #t, 1, -1`.
     let mut for_loop_locals = FxHashSet::default();
     for node in function.graph().node_indices() {
         if let Some(block) = function.block(node) {
             for stat in &block.0 {
                 match stat {
                     ast::Statement::NumForInit(nfi) => {
-                        for_loop_locals.extend(nfi.values_read().into_iter().cloned());
                         for_loop_locals.extend(nfi.values_written().into_iter().cloned());
                     }
                     ast::Statement::NumForNext(nfn) => {
-                        for_loop_locals.extend(nfn.values_read().into_iter().cloned());
                         for_loop_locals.extend(nfn.values_written().into_iter().cloned());
                     }
                     ast::Statement::GenericForInit(gfi) => {
-                        for_loop_locals.extend(gfi.values_read().into_iter().cloned());
                         for_loop_locals.extend(gfi.values_written().into_iter().cloned());
                     }
                     ast::Statement::GenericForNext(gfn) => {
-                        for_loop_locals.extend(gfn.values_read().into_iter().cloned());
                         for_loop_locals.extend(gfn.values_written().into_iter().cloned());
                     }
                     _ => {}
